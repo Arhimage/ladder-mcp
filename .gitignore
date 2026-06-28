@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.orig
+
+# Test / coverage
+coverage/
+.vitest/
+*.lcov
+
+# Vendored BMAD skills (tooling, not project code)
+.agents/skills/
+.claude/skills/
+
+# Embedded upstream repo (cloned separately)
+kimi-code-mcp/
+
+# Personal BMad install answers (regenerated per machine; contains user identity)
+*.user.toml
+
+# Local machine MCP config (machine-specific absolute paths)
+.mcp.json
+
+# BMad tooling + planning artifacts (local workflow, not shipped)
+_bmad/
+_bmad-output/
