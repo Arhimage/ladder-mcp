@@ -4,7 +4,9 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — Remediation milestone
+## [Unreleased]
+
+## [1.2.0] - 2026-06-29 — Remediation milestone
 
 ### Breaking
 
@@ -54,6 +56,16 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 - `extractTextDeep` recursion is now depth-bounded.
 - `canonicalizePath` rejects paths whose ancestors do not exist under a real
   directory instead of returning a potentially-escaping resolved path.
+- `kimi_ask` now honors `max_output_tokens` for the response size guard; long
+  answers were previously capped at the 8 KB default regardless of the budget.
+- `kimi_code` success responses keep the terminal envelope (`session_id` /
+  continuation) even when the body is truncated by the size guard.
+- Background `kimi_code` preserves the `session_id` in the task error on a
+  resumable timeout so the session can still be continued via `kimi_tasks`.
+- `kimi_tasks` `output` reports zero lines for an empty task log instead of a
+  single phantom empty line.
+- ACP responses surface thinking text as the body when there are no assistant
+  message chunks, instead of returning an empty response.
 
 ## [1.1.6] - 2026-06-28
 
