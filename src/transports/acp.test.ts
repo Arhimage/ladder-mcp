@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { AcpClient, AcpMessageParser, clampTimeout, encodeAcpMessage, extractAcpText, runAcpPrompt } from './acp.js'
+import { AcpClient, AcpMessageParser, clampTimeout, encodeAcpMessage, extractAcpText, resolveAcpTimeout, runAcpPrompt, ACP_TIMEOUT_FLOOR_MS } from './acp.js'
 import type { ProgressEvent } from '../types.js'
 
 vi.mock('../environment.js', () => ({
@@ -103,6 +103,12 @@ describe('acp transport', () => {
     expect(clampTimeout(undefined, 120_000)).toBe(120_000)
     expect(clampTimeout(30_000, 120_000)).toBe(30_000)
   })
+
+  it('resolves ACP prompt timeouts to the 30-minute floor', () => {
+    expect(resolveAcpTimeout(undefined)).toBe(ACP_TIMEOUT_FLOOR_MS)
+    expect(resolveAcpTimeout(30_000)).toBe(ACP_TIMEOUT_FLOOR_MS)
+    expect(resolveAcpTimeout(3_600_000)).toBe(3_600_000)
+  })
 })
 
 describe('acp bidirectional request handling', () => {
@@ -166,7 +172,8 @@ describe('acp bidirectional request handling', () => {
     ])
 
     expect(notifications.length).toBe(4)
-    expect(client.getUpdateText()).toContain('thinking')
+    expect(client.getUpdateText()).not.toContain('thinking')
+    expect(client.getThinkingText()).toContain('thinking')
   })
 
   it('respond() writes a framed JSON-RPC reply for unknown methods', async () => {
@@ -436,6 +443,7 @@ describe('acp progress reporting', () => {
             proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: requestId, result: { sessionId: 's1' } }))
           } else if (message.method === 'session/prompt') {
             proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } } } }))
+            proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hidden thought' } } } }))
             proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'b' } } } }))
             proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Write' } } }))
             proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', method: 'session/update', params: { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'c' } } } }))
@@ -468,6 +476,28 @@ describe('acp progress reporting', () => {
     expect(messageEvents.length).toBeLessThan(3)
     expect(messageEvents.some((e) => e.text.includes('c'))).toBe(true)
     expect(events.some((e) => e.kind === 'tool_call')).toBe(true)
+  })
+
+  it('does not include thinking in the result unless requested', async () => {
+    const { proc } = createMockAcpServer()
+    vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const result = await runAcpPrompt({ prompt: 'hello' })
+
+    expect(result.ok).toBe(true)
+    expect(result.text).not.toContain('hidden thought')
+    expect(result.thinking).toBeUndefined()
+  })
+
+  it('returns thinking only when includeThinking is true', async () => {
+    const { proc } = createMockAcpServer()
+    vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const result = await runAcpPrompt({ prompt: 'hello', includeThinking: true })
+
+    expect(result.ok).toBe(true)
+    expect(result.text).not.toContain('hidden thought')
+    expect(result.thinking).toContain('hidden thought')
   })
 
   it('emits a todo event when a tool_call_update carries a TodoList payload', async () => {

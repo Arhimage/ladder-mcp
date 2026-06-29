@@ -201,7 +201,7 @@ export interface ProgressCoalescerOptions {
 }
 
 export interface ProgressCoalescer {
-  add(kind: ProgressKind, text: string, metadata?: { todoFullList?: string }): void
+  add(kind: ProgressKind, text: string, metadata?: { todoFullList?: string; toolCallId?: string }): void
   flush(): void
   stop(): void
 }
@@ -225,6 +225,22 @@ export function createProgressCoalescer(
   let timer: NodeJS.Timeout | undefined
   let priorityTimer: NodeJS.Timeout | undefined
   let priorityUntil = 0
+  let lastToolCallId: string | undefined
+  let lastToolCallText: string | undefined
+
+  const isDuplicateToolEvent = (kind: ProgressKind, text: string, toolCallId: string | undefined): boolean => {
+    if (!toolCallId) return false
+    if ((kind !== 'tool_call' && kind !== 'tool_update') || toolCallId !== lastToolCallId) {
+      lastToolCallId = toolCallId
+      lastToolCallText = text
+      return false
+    }
+    // Same toolCallId as the last tool event. Drop only if the text is identical;
+    // a changed payload (e.g. status update) is still worth surfacing.
+    if (text === lastToolCallText) return true
+    lastToolCallText = text
+    return false
+  }
 
   const emitTails = () => {
     for (const kind of ['message', 'thought'] as const) {
@@ -281,6 +297,8 @@ export function createProgressCoalescer(
   }
 
   const add: ProgressCoalescer['add'] = (kind, text, metadata) => {
+    if (isDuplicateToolEvent(kind, text, metadata?.toolCallId)) return
+
     if (kind === 'tool_call' || kind === 'tool_update' || kind === 'plan') {
       // During a TODO priority window, action events still surface but chatty
       // message/thought previews stay suppressed so the checklist remains visible.
@@ -325,17 +343,26 @@ export interface StallWatchdog {
 export function createStallWatchdog(reporter: ProgressReporter, stallMs = DEFAULT_STALL_MS): StallWatchdog {
   let timer: NodeJS.Timeout | undefined
   let stopped = false
+  let consecutiveStalls = 0
+
+  const nextDelay = () => {
+    // Back off so a long silent reasoning phase does not emit a stall every
+    // fixed interval. First stall at stallMs, then 2x, 4x, capped at 8x.
+    const multiplier = consecutiveStalls >= 3 ? 8 : 2 ** consecutiveStalls
+    return stallMs * multiplier
+  }
 
   const arm = () => {
     if (stopped) return
     timer = setTimeout(() => {
       try {
-        reporter(makeEvent('stall', `no activity for ${Math.round(stallMs / 1000)}s — Kimi may be stuck`))
+        reporter(makeEvent('stall', `no activity for ${Math.round(nextDelay() / 1000)}s — Kimi may be stuck`))
       } catch {
         // A throwing reporter must not kill the watchdog: always re-arm below.
       }
+      consecutiveStalls += 1
       arm()
-    }, stallMs)
+    }, nextDelay())
     // Do not keep the event loop alive solely for the watchdog.
     timer.unref?.()
   }
@@ -345,6 +372,7 @@ export function createStallWatchdog(reporter: ProgressReporter, stallMs = DEFAUL
   return {
     ping() {
       if (stopped) return
+      consecutiveStalls = 0
       if (timer) clearTimeout(timer)
       arm()
     },

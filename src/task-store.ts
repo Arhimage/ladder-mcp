@@ -4,8 +4,9 @@ const MAX_TASK_OUTPUT_CHARS = 100_000
 const MAX_TASK_OUTPUT_CHUNKS = 1_000
 const MAX_TASKS = 100
 const CANCEL_HOOK_TIMEOUT_MS = 5_000
+const MAX_SNAPSHOT_ERROR_CHARS = 500
 
-export interface TaskSnapshot {
+export interface TaskStatusSnapshot {
   id: string
   kind: string
   status: TaskStatus
@@ -13,15 +14,35 @@ export interface TaskSnapshot {
   startedAt?: string
   updatedAt: string
   finishedAt?: string
+  error?: string
+  outputLength: number
+  metadata?: Record<string, unknown>
+}
+
+export interface TaskSnapshot extends TaskStatusSnapshot {
   output: string
   outputChunks: string[]
+}
+
+export interface TaskOutputSlice {
+  id: string
+  status: TaskStatus
+  mode: 'final' | 'full'
+  lines: string[]
+  offset: number
+  totalLines: number
+  hasMore: boolean
   error?: string
-  metadata?: Record<string, unknown>
 }
 
 interface TaskRecord extends TaskSnapshot {
   controller: AbortController
   cancel?: () => void | Promise<void>
+}
+
+function randomTaskSuffix(): string {
+  // ~6 random base-36 digits are enough to avoid collisions across in-memory restarts.
+  return Math.random().toString(36).slice(2, 8)
 }
 
 export class TaskStore {
@@ -32,9 +53,9 @@ export class TaskStore {
     kind: string,
     executor: (signal: AbortSignal, append: (text: string) => void) => Promise<{ output?: string; metadata?: Record<string, unknown> }>,
     cancel?: () => void | Promise<void>,
-  ): TaskSnapshot {
+  ): TaskStatusSnapshot {
     const now = new Date().toISOString()
-    const id = `task_${this.nextId++}`
+    const id = `task_${this.nextId++}_${randomTaskSuffix()}`
     const controller = new AbortController()
     const task: TaskRecord = {
       id,
@@ -44,6 +65,7 @@ export class TaskStore {
       updatedAt: now,
       output: '',
       outputChunks: [],
+      outputLength: 0,
       controller,
       cancel,
     }
@@ -73,7 +95,7 @@ export class TaskStore {
       }
     })
 
-    return this.snapshot(task)
+    return this.statusSnapshot(task)
   }
 
   get(id: string): TaskSnapshot | undefined {
@@ -81,16 +103,55 @@ export class TaskStore {
     return task ? this.snapshot(task) : undefined
   }
 
-  list(): TaskSnapshot[] {
+  status(id: string): TaskStatusSnapshot | undefined {
+    const task = this.tasks.get(id)
+    return task ? this.statusSnapshot(task) : undefined
+  }
+
+  list(): TaskStatusSnapshot[] {
     return [...this.tasks.values()]
-      .map((task) => this.snapshot(task))
+      .map((task) => this.statusSnapshot(task))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
 
-  async cancel(id: string): Promise<TaskSnapshot | undefined> {
+  output(id: string, mode: 'final' | 'full' = 'full', offset = 0, limit = 100): TaskOutputSlice | undefined {
     const task = this.tasks.get(id)
     if (!task) return undefined
-    if (['succeeded', 'failed', 'cancelled'].includes(task.status)) return this.snapshot(task)
+    const lines = task.output ? task.output.split('\n') : []
+    const totalLines = lines.length
+    const safeOffset = Math.max(0, Math.min(offset, totalLines))
+    let safeLimit = Math.max(1, limit)
+    if (mode === 'final') {
+      // Final mode returns the trailing slice (default last line) regardless of offset.
+      safeLimit = Math.max(1, limit)
+      const start = Math.max(0, totalLines - safeLimit)
+      return {
+        id: task.id,
+        status: task.status,
+        mode,
+        lines: lines.slice(start),
+        offset: start,
+        totalLines,
+        hasMore: start > 0,
+        error: task.error ? this.truncateError(task.error) : undefined,
+      }
+    }
+    return {
+      id: task.id,
+      status: task.status,
+      mode,
+      lines: lines.slice(safeOffset, safeOffset + safeLimit),
+      offset: safeOffset,
+      totalLines,
+      hasMore: safeOffset + safeLimit < totalLines,
+      error: task.error ? this.truncateError(task.error) : undefined,
+    }
+  }
+
+  async cancel(id: string): Promise<TaskStatusSnapshot | undefined> {
+    const task = this.tasks.get(id)
+    if (!task) return undefined
+    if (['succeeded', 'failed', 'cancelled'].includes(task.status)) return this.statusSnapshot(task)
     // Mark terminal up-front (synchronously, before the first await) so a concurrent
     // cancel(id) sees `cancelled` and returns via the guard above instead of running
     // the (possibly non-idempotent) cancel hook a second time on the same child.
@@ -109,7 +170,7 @@ export class TaskStore {
         task.error = task.error ? `${task.error}; cancel hook also failed: ${cancelError}` : cancelError
       }
     }
-    return this.snapshot(task)
+    return this.statusSnapshot(task)
   }
 
   append(id: string, text: string): void {
@@ -121,6 +182,7 @@ export class TaskStore {
     task.outputChunks.push(text)
     task.output = task.output ? `${task.output}\n${text}` : text
     this.trimOutput(task)
+    task.outputLength = task.output.length
     task.updatedAt = new Date().toISOString()
   }
 
@@ -152,6 +214,7 @@ export class TaskStore {
       task.output = task.outputChunks[0]
     }
 
+    task.outputLength = task.output.length
     this.noteTruncation(task, 'Task output exceeded the maximum size and was truncated.')
   }
 
@@ -182,7 +245,12 @@ export class TaskStore {
     })
   }
 
-  private snapshot(task: TaskRecord): TaskSnapshot {
+  private truncateError(error: string): string {
+    if (error.length <= MAX_SNAPSHOT_ERROR_CHARS) return error
+    return `${error.slice(0, MAX_SNAPSHOT_ERROR_CHARS)}… [error truncated]`
+  }
+
+  private statusSnapshot(task: TaskRecord): TaskStatusSnapshot {
     return {
       id: task.id,
       kind: task.kind,
@@ -191,10 +259,17 @@ export class TaskStore {
       startedAt: task.startedAt,
       updatedAt: task.updatedAt,
       finishedAt: task.finishedAt,
+      error: task.error ? this.truncateError(task.error) : undefined,
+      outputLength: task.output.length,
+      metadata: task.metadata ? { ...task.metadata } : undefined,
+    }
+  }
+
+  private snapshot(task: TaskRecord): TaskSnapshot {
+    return {
+      ...this.statusSnapshot(task),
       output: task.output,
       outputChunks: task.outputChunks.slice(-MAX_TASK_OUTPUT_CHUNKS),
-      error: task.error,
-      metadata: task.metadata ? { ...task.metadata } : undefined,
     }
   }
 }

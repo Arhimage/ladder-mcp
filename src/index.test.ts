@@ -7,7 +7,8 @@ const registeredTools: Record<
 
 function createMockServer() {
   return {
-    tool: vi.fn((name: string, description: string, schema: Record<string, unknown>, handler: (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>) => {
+    tool: vi.fn((name: string, description: string, schema: Record<string, unknown>, ...rest: unknown[]) => {
+      const handler = rest[rest.length - 1] as (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>
       registeredTools[name] = { description, schema, handler }
     }),
   }
@@ -42,9 +43,7 @@ vi.mock('./kimi-api.js', () => ({
   isApiConfigured: vi.fn().mockReturnValue(false),
 }))
 
-vi.mock('./kimi-runner.js', () => ({
-  runKimi: vi.fn().mockResolvedValue({ ok: true, text: 'cli response', sessionId: 'sess_123' }),
-}))
+
 
 vi.mock('./session-store.js', () => ({
   listSessions: vi.fn().mockReturnValue([]),
@@ -54,6 +53,7 @@ vi.mock('./transports/acp.js', () => ({
   runAcpPrompt: vi.fn().mockResolvedValue({ ok: true, text: 'acp response' }),
   listAcpSessions: vi.fn().mockResolvedValue({ ok: true, text: '{"sessions":[]}' }),
   cancelAcpSession: vi.fn().mockResolvedValue({ ok: true, text: '{}' }),
+  ACP_TIMEOUT_FLOOR_MS: 1_800_000,
 }))
 
 vi.mock('./transports/cli-admin.js', () => ({
@@ -65,20 +65,31 @@ vi.mock('./transports/cli-admin.js', () => ({
 }))
 
 const fakeTask = {
-  id: 'task_1',
+  id: 'task_1_abcdef',
   kind: 'test',
   status: 'pending',
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:00:00.000Z',
-  output: '',
-  outputChunks: [],
+  outputLength: 0,
+}
+
+const fakeOutputSlice = {
+  id: 'task_1_abcdef',
+  status: 'pending',
+  mode: 'full',
+  lines: [],
+  offset: 0,
+  totalLines: 0,
+  hasMore: false,
 }
 
 const fakeTaskStore = {
   create: vi.fn().mockReturnValue(fakeTask),
   get: vi.fn().mockReturnValue(fakeTask),
+  status: vi.fn().mockReturnValue(fakeTask),
   list: vi.fn().mockReturnValue([fakeTask]),
   cancel: vi.fn().mockReturnValue(fakeTask),
+  output: vi.fn().mockReturnValue(fakeOutputSlice),
 }
 
 vi.mock('./task-store.js', () => ({
@@ -157,8 +168,9 @@ describe('kimi_code', () => {
     await loadServer()
     const { runAcpPrompt } = await import('./transports/acp.js')
     const result = await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'hello', sessionMode: 'new' }))
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('hello'), sessionMode: 'new' }))
     expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('acp response') }], isError: false })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.not.stringContaining('If this call reports a timeout') }], isError: false })
   })
 
   it('rejects invalid work_dir', async () => {
@@ -180,77 +192,44 @@ describe('kimi_code', () => {
     }
   })
 
-  it('uses acp transport when requested', async () => {
+  it('passes timeout_ms through to ACP transport', async () => {
     await loadServer()
     const { runAcpPrompt } = await import('./transports/acp.js')
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'acp' })
-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'hello', sessionMode: 'new' }))
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', timeout_ms: 30_000 })
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 30_000 }))
   })
 
-  it('passes edit flag to cli transport', async () => {
+  it('prefixes ACP prompts with read-only guard by default', async () => {
     await loadServer()
-    const { runKimi } = await import('./kimi-runner.js')
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', edit: true })
-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ edit: true }))
+    const { runAcpPrompt } = await import('./transports/acp.js')
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('READ-ONLY MODE') }))
+  })
+
+  it('prefixes ACP prompts with edit guard when edit=true', async () => {
+    await loadServer()
+    const { runAcpPrompt } = await import('./transports/acp.js')
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', edit: true })
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('EDIT MODE') }))
+  })
+
+  it('allows timeout_ms above the ACP floor', async () => {
+    await loadServer()
+    const { runAcpPrompt } = await import('./transports/acp.js')
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', timeout_ms: 3_600_000 })
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 3_600_000 }))
+  })
+
+  it('has no cli transport parameter', async () => {
+    await loadServer()
+    expect(registeredTools.kimi_code.schema.transport).toBeUndefined()
   })
 
   it('honors acp session_mode=load', async () => {
     await loadServer()
     const { runAcpPrompt } = await import('./transports/acp.js')
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'acp', session_id: 'sess_1', session_mode: 'load' })
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', session_id: 'sess_1', session_mode: 'load' })
     expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess_1', sessionMode: 'load' }))
-  })
-
-  it('tracks background cli work as a task', async () => {
-    await loadServer()
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', background: true })
-    expect(fakeTaskStore.create).toHaveBeenCalledWith('cli-code', expect.any(Function))
-  })
-
-  it('passes onProgress to foreground cli handler', async () => {
-    await loadServer()
-    const { runKimi } = await import('./kimi-runner.js')
-    const sendNotification = vi.fn()
-    await registeredTools.kimi_code.handler(
-      { prompt: 'hello', work_dir: 'C:\\good', transport: 'cli' },
-      { sendNotification, _meta: { progressToken: 'token' } },
-    )
-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ onProgress: expect.any(Function) }))
-  })
-
-  it('passes MCP cancellation signal to foreground cli handler', async () => {
-    await loadServer()
-    const { runKimi } = await import('./kimi-runner.js')
-    const signal = new AbortController().signal
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli' }, { signal })
-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ signal }))
-  })
-
-  it('appends formatted progress lines to background cli task output', async () => {
-    await loadServer()
-    const { runKimi } = await import('./kimi-runner.js')
-    vi.mocked(runKimi).mockImplementationOnce(async (config) => {
-      config.onProgress?.({ kind: 'message', text: 'streaming output… (10 chars)', at: '2026-01-01T00:00:00.000Z' })
-      return { ok: true, text: 'cli response', sessionId: 'sess_123' }
-    })
-
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', background: true })
-    const executor = fakeTaskStore.create.mock.calls[0][1]
-    const append = vi.fn()
-    await executor(new AbortController().signal, append)
-
-    expect(append).toHaveBeenCalled()
-    expect(append.mock.calls[0][0]).toContain('message:')
-  })
-
-  it('passes cancellation signal to background cli executor', async () => {
-    await loadServer()
-    const { runKimi } = await import('./kimi-runner.js')
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', background: true })
-    const executor = fakeTaskStore.create.mock.calls[0][1]
-    const signal = new AbortController().signal
-    await executor(signal, vi.fn())
-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ signal }))
   })
 
   it('passes onProgress to foreground acp handler', async () => {
@@ -258,7 +237,7 @@ describe('kimi_code', () => {
     const { runAcpPrompt } = await import('./transports/acp.js')
     const sendNotification = vi.fn()
     await registeredTools.kimi_code.handler(
-      { prompt: 'hello', work_dir: 'C:\\good', transport: 'acp' },
+      { prompt: 'hello', work_dir: 'C:\\good' },
       { sendNotification, _meta: { progressToken: 'token' } },
     )
     expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ onProgress: expect.any(Function) }))
@@ -268,7 +247,7 @@ describe('kimi_code', () => {
     await loadServer()
     const { runAcpPrompt } = await import('./transports/acp.js')
     const signal = new AbortController().signal
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'acp' }, { signal })
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' }, { signal })
     expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ signal }))
   })
 
@@ -276,6 +255,16 @@ describe('kimi_code', () => {
     await loadServer()
     await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', background: true })
     expect(fakeTaskStore.create).toHaveBeenCalledWith('acp-code', expect.any(Function))
+  })
+
+  it('includes continuation instruction and session_id in timeout response', async () => {
+    await loadServer()
+    const { runAcpPrompt } = await import('./transports/acp.js')
+    vi.mocked(runAcpPrompt).mockResolvedValueOnce({ ok: false, text: '', error: 'ACP request timed out', sessionId: 'sess_timeout', resumable: true })
+    const result = await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
+    expect(result).toEqual(expect.objectContaining({ isError: true }))
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('new_session=false') }], isError: true })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('sess_timeout') }], isError: true })
   })
 })
 
@@ -345,16 +334,48 @@ describe('kimi_tasks dispatch', () => {
     expect(fakeTaskStore.list).toHaveBeenCalled()
   })
 
-  it('action=status gets one task when task_id provided', async () => {
+  it('action=status gets compact metadata when task_id provided', async () => {
     await loadServer()
     await registeredTools.kimi_tasks.handler({ action: 'status', task_id: 'task_1' })
-    expect(fakeTaskStore.get).toHaveBeenCalledWith('task_1')
+    expect(fakeTaskStore.status).toHaveBeenCalledWith('task_1')
+  })
+
+  it('action=status snapshot does not include output body', async () => {
+    await loadServer()
+    const result = await registeredTools.kimi_tasks.handler({ action: 'status', task_id: 'task_1' })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.not.stringContaining('"output"') }], isError: false })
   })
 
   it('action=output requires task_id', async () => {
     await loadServer()
     const result = await registeredTools.kimi_tasks.handler({ action: 'output' })
     expect(result).toEqual({ content: [{ type: 'text', text: 'task_id is required for action=output.' }], isError: true })
+  })
+
+  it('action=output paginates full mode', async () => {
+    await loadServer()
+    await registeredTools.kimi_tasks.handler({ action: 'output', task_id: 'task_1', mode: 'full', offset: 10, limit: 50 })
+    expect(fakeTaskStore.output).toHaveBeenCalledWith('task_1', 'full', 10, 50)
+  })
+
+  it('action=output supports final mode', async () => {
+    await loadServer()
+    await registeredTools.kimi_tasks.handler({ action: 'output', task_id: 'task_1', mode: 'final' })
+    expect(fakeTaskStore.output).toHaveBeenCalledWith('task_1', 'final', 0, 100)
+  })
+
+  it('action=output keeps oversized JSON responses parseable', async () => {
+    fakeTaskStore.output.mockReturnValueOnce({
+      ...fakeOutputSlice,
+      lines: ['x'.repeat(20_000)],
+      totalLines: 1,
+    })
+    await loadServer()
+    const result = await registeredTools.kimi_tasks.handler({ action: 'output', task_id: 'task_1' }) as { content: [{ text: string }]; isError: boolean }
+    expect(result.isError).toBe(false)
+    const parsed = JSON.parse(result.content[0].text) as { truncated?: boolean; message?: string }
+    expect(parsed.truncated).toBe(true)
+    expect(parsed.message).toContain('smaller valid JSON response')
   })
 
   it('action=cancel rejects both task_id and session_id', async () => {
@@ -378,6 +399,19 @@ describe('kimi_status detail switch', () => {
     const result = await registeredTools.kimi_status.handler({ detail: 'basic' })
     expect(getKimiCapabilities).not.toHaveBeenCalled()
     expect(result).toEqual(expect.objectContaining({ isError: false }))
+  })
+
+  it('separates session auth from api auth', async () => {
+    await loadServer()
+    const result = await registeredTools.kimi_status.handler({ detail: 'basic' })
+    expect(result).toEqual({
+      content: [{ type: 'text', text: expect.stringContaining('Session authenticated (for kimi_code)') }],
+      isError: false,
+    })
+    expect(result).toEqual({
+      content: [{ type: 'text', text: expect.stringContaining('Kimi Code API auth (for kimi_ask)') }],
+      isError: false,
+    })
   })
 
   it('detail=full adds capabilities, doctor, and providers', async () => {

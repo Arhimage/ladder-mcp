@@ -108,7 +108,9 @@ function readTomlString(raw: string, key: string): string | undefined {
 export function loadApiAuth(options?: EnvironmentOptions): ApiAuth | null {
   const env = getEnv(options)
   const paths = resolveKimiPaths(options)
-  let apiKey = env.KIMICODE_API_KEY ?? ''
+  // KIMI_API_KEY is the real kimi-code variable; KIMICODE_API_KEY is a legacy
+  // name invented by this wrapper and kept for backward compatibility.
+  let apiKey = env.KIMI_API_KEY ?? env.KIMICODE_API_KEY ?? ''
   let baseUrl = env.KIMI_BASE_URL ?? ''
 
   if ((!apiKey || !baseUrl) && exists(paths.configPath, options)) {

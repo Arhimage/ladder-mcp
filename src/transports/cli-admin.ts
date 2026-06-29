@@ -80,8 +80,11 @@ function canonicalizePath(target: string): string {
         throw new Error(`output_path could not be canonicalized: ${error instanceof Error ? error.message : String(error)}`)
       }
       const parent = path.dirname(current)
-      if (parent === current) return path.resolve(target)
-      tail.push(path.basename(current))
+      const base = path.basename(current)
+      if (parent === current) {
+        throw new Error(`output_path could not be canonicalized: path does not exist under a real directory: ${target}`)
+      }
+      tail.push(base)
       current = parent
     }
   }

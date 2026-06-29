@@ -11,7 +11,7 @@ const MAX_ACP_FRAME_BYTES = 8 * 1024 * 1024
 const MAX_ACP_HEADER_BYTES = 16 * 1024
 const MAX_ACP_METADATA_BYTES = 100 * 1024
 const MAX_ACP_UPDATE_CHUNKS = 10_000
-const DEFAULT_ACP_TIMEOUT_MS = 120_000
+export const ACP_TIMEOUT_FLOOR_MS = 1_800_000
 const CONTENT_LENGTH_PREFIX_BYTES = 'Content-Length:'.length
 const OUTBOUND_ID_SPACE_START = 1_000_000
 const MAX_FS_READ_BYTES = 8 * 1024 * 1024
@@ -30,6 +30,10 @@ class AcpError extends Error {
 // request before the peer can reply; fall back to a sane default in that case.
 export function clampTimeout(ms: number | undefined, fallback: number): number {
   return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : fallback
+}
+
+export function resolveAcpTimeout(timeoutMs?: number): number {
+  return timeoutMs === undefined ? ACP_TIMEOUT_FLOOR_MS : Math.max(ACP_TIMEOUT_FLOOR_MS, timeoutMs)
 }
 
 // Locate the end of a header block, accepting both the canonical CRLF terminator
@@ -63,6 +67,7 @@ export interface AcpPromptOptions {
   timeoutMs?: number
   signal?: AbortSignal
   onProgress?: ProgressReporter
+  includeThinking?: boolean
 }
 
 export function encodeAcpMessage(message: JsonRpcMessage): Buffer {
@@ -189,16 +194,19 @@ function parseJsonRpcObject(payload: string): JsonRpcMessage {
   }
 }
 
-function extractTextDeep(value: unknown): string[] {
+const MAX_EXTRACT_DEPTH = 20
+
+function extractTextDeep(value: unknown, depth = 0): string[] {
   if (typeof value === 'string') return [value]
   if (!value || typeof value !== 'object') return []
-  if (Array.isArray(value)) return value.flatMap(extractTextDeep)
+  if (depth > MAX_EXTRACT_DEPTH) return []
+  if (Array.isArray(value)) return value.flatMap((item) => extractTextDeep(item, depth + 1))
   const record = value as Record<string, unknown>
   const direct = ['text', 'delta']
     .map((key) => record[key])
     .filter((item): item is string => typeof item === 'string')
   const nested = ['content', 'message', 'update', 'updates', 'result']
-    .flatMap((key) => extractTextDeep(record[key]))
+    .flatMap((key) => extractTextDeep(record[key], depth + 1))
   return [...direct, ...nested]
 }
 
@@ -225,11 +233,16 @@ export function truncateUtf8Tail(text: string, maxBytes: number): string {
 
 function killProcessTree(pid: number | undefined): void {
   if (!pid) return
-  const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
-    stdio: 'ignore',
-    windowsHide: true,
-  })
-  killer.on('error', () => undefined)
+  try {
+    const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    // `spawn` can return undefined in test mocks or if taskkill is missing.
+    killer?.on('error', () => undefined)
+  } catch {
+    // Best-effort cleanup; do not let a kill failure mask the original result.
+  }
 }
 
 export class AcpClient extends EventEmitter {
@@ -238,6 +251,7 @@ export class AcpClient extends EventEmitter {
   private nextId = OUTBOUND_ID_SPACE_START
   private pending = new Map<number | string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>()
   private updates: string[] = []
+  private thoughts: string[] = []
   private readonly timeoutMs: number
   private canonicalRoot?: string
   private closing = false
@@ -245,9 +259,9 @@ export class AcpClient extends EventEmitter {
   workDir?: string
   readonly closed: Promise<void>
 
-  constructor(timeoutMs = DEFAULT_ACP_TIMEOUT_MS) {
+  constructor(timeoutMs = ACP_TIMEOUT_FLOOR_MS) {
     super()
-    this.timeoutMs = clampTimeout(timeoutMs, DEFAULT_ACP_TIMEOUT_MS)
+    this.timeoutMs = clampTimeout(timeoutMs, ACP_TIMEOUT_FLOOR_MS)
     this.closed = new Promise<void>((resolve) => {
       this.resolveClosed = resolve
     })
@@ -342,6 +356,10 @@ export class AcpClient extends EventEmitter {
     return this.updates.join('').trim()
   }
 
+  getThinkingText(): string {
+    return this.thoughts.join('').trim()
+  }
+
   close(): void {
     if (this.closing) return
     this.closing = true
@@ -394,10 +412,10 @@ export class AcpClient extends EventEmitter {
       if (message.method === 'session/update') {
         const params = message.params as { update?: { sessionUpdate?: string; content?: unknown } } | undefined
         const updateType = params?.update?.sessionUpdate
-        // Surface text from message and thought chunks; tool_call / tool_call_update / plan
+        // Surface text from message chunks; tool_call / tool_call_update / plan
         // variants are emitted as notifications below so callers can wire them to progress
         // reporters (Story 5.4) without polluting the assembled response text.
-        if (updateType === 'agent_message_chunk' || updateType === 'agent_thought_chunk') {
+        if (updateType === 'agent_message_chunk') {
           const text = extractAcpText(params?.update?.content)
           if (text) {
             this.updates.push(text)
@@ -405,6 +423,15 @@ export class AcpClient extends EventEmitter {
             // array without limit; drop oldest chunks past the cap.
             if (this.updates.length > MAX_ACP_UPDATE_CHUNKS) {
               this.updates.splice(0, this.updates.length - MAX_ACP_UPDATE_CHUNKS)
+            }
+          }
+        }
+        if (updateType === 'agent_thought_chunk') {
+          const text = extractAcpText(params?.update?.content)
+          if (text) {
+            this.thoughts.push(text)
+            if (this.thoughts.length > MAX_ACP_UPDATE_CHUNKS) {
+              this.thoughts.splice(0, this.thoughts.length - MAX_ACP_UPDATE_CHUNKS)
             }
           }
         }
@@ -467,7 +494,16 @@ export class AcpClient extends EventEmitter {
           const filePath = await this.resolveSandboxedPath(record?.path)
           const content = typeof record?.content === 'string' ? record.content : String(record?.content ?? '')
           await fs.mkdir(path.dirname(filePath), { recursive: true })
-          await fs.writeFile(filePath, content, 'utf-8')
+          // Atomic write: write to a sibling temp file and rename into place so a
+          // crash cannot leave a partially-written file.
+          const tempPath = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+          try {
+            await fs.writeFile(tempPath, content, 'utf-8')
+            await fs.rename(tempPath, filePath)
+          } catch (error) {
+            try { await fs.unlink(tempPath) } catch { /* ignore cleanup failure */ }
+            throw error
+          }
           this.respond(id, {})
           return
         }
@@ -593,7 +629,9 @@ function extractSessionId(value: unknown, fallback?: string): string | undefined
 
 export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResult> {
   if (options.signal?.aborted) return { ok: false, text: '', error: 'ACP prompt was aborted before start.' }
-  const client = new AcpClient(options.timeoutMs)
+  // The ACP timeout floor is mandatory: Kimi tasks routinely run longer than a
+  // couple of minutes, and the wrapper (not the host) owns the timeout.
+  const client = new AcpClient(resolveAcpTimeout(options.timeoutMs))
   const abort = () => client.close()
   options.signal?.addEventListener('abort', abort, { once: true })
   // Cover the race where the signal aborts between the pre-check above and listener
@@ -634,7 +672,8 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
             coalescer?.add('todo', todoTracker.getSummary(), { todoFullList: todoTracker.getFullList() })
           }
           const kind = updateType === 'tool_call' ? 'tool_call' : updateType === 'tool_call_update' ? 'tool_update' : 'plan'
-          coalescer?.add(kind, text)
+          const toolCallId = typeof update?.toolCallId === 'string' ? update.toolCallId : undefined
+          coalescer?.add(kind, text, toolCallId ? { toolCallId } : undefined)
           break
         }
       }
@@ -642,22 +681,26 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
     client.on('notification', onNotification)
   }
 
+  let sessionId: string | undefined
   try {
     client.workDir = options.workDir
     await client.initialize()
-    let sessionId = options.sessionId
-    if (sessionId && options.sessionMode === 'load') {
-      sessionId = extractSessionId(await client.loadSession(sessionId), sessionId)
-    } else if (sessionId && options.sessionMode === 'resume') {
-      sessionId = extractSessionId(await client.resumeSession(sessionId), sessionId)
-    } else if (!sessionId) {
+    if (options.sessionId && options.sessionMode === 'load') {
+      sessionId = extractSessionId(await client.loadSession(options.sessionId), options.sessionId)
+    } else if (options.sessionId && options.sessionMode === 'resume') {
+      sessionId = extractSessionId(await client.resumeSession(options.sessionId), options.sessionId)
+    } else if (!options.sessionId) {
       sessionId = extractSessionId(await client.newSession(options.workDir))
+    } else {
+      sessionId = options.sessionId
     }
 
     const result = await client.prompt(sessionId, options.prompt, options.workDir)
     // extractAcpText no longer trims fragments (to preserve inter-token spaces),
     // so trim the fully assembled string here. getUpdateText already trims.
-    let text = extractAcpText(result).trim() || client.getUpdateText()
+    const updateText = client.getUpdateText()
+    const thinkingText = client.getThinkingText()
+    let text = extractAcpText(result).trim() || updateText || thinkingText
     if (!text) {
       try {
         text = JSON.stringify(result, null, 2)
@@ -673,12 +716,20 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
     } catch {
       metadata = { truncated: true, reason: 'result is not JSON-serializable' }
     }
-    return { ok: true, text: text || '(empty ACP response from Kimi)', sessionId, metadata }
+    const thinking = options.includeThinking && updateText ? thinkingText || undefined : undefined
+    return { ok: true, text: text || '(empty ACP response from Kimi)', thinking, sessionId, metadata }
   } catch (error) {
     const message = options.signal?.aborted
       ? 'Kimi cancelled'
       : error instanceof Error ? error.message : String(error)
-    return { ok: false, text: '', error: message }
+    const isTimeout = /timed out/i.test(message)
+    return {
+      ok: false,
+      text: '',
+      error: message,
+      sessionId,
+      resumable: isTimeout && Boolean(sessionId),
+    }
   } finally {
     if (onNotification) client.off('notification', onNotification)
     coalescer?.stop()

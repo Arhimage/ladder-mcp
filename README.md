@@ -16,9 +16,9 @@ without hardcoded POSIX assumptions.
 ## Highlights
 
 - **Agentic codegen & analysis** — point Kimi at a repo to read or edit files.
-- **Two transports** — persistent **ACP** JSON-RPC (default) with granular,
-  watchable live progress and interactive permission prompts, or robust one-shot
-  **CLI**. [Pick one →](#transports-cli-vs-acp)
+- **ACP-only transport** — `kimi_code` drives Kimi through the persistent ACP
+  JSON-RPC session, with granular watchable live progress and interactive
+  permission prompts.
 - **Background tasks** — kick off long runs and poll status/output, with a live
   TODO checklist surfaced as Kimi works.
 - **Independent review** — `kimi_ask` runs stateless questions or a skeptical
@@ -89,18 +89,17 @@ tool to produce/merge a `.kimi-code/mcp.json` entry.
 
 | Tool | Purpose | Key parameters |
 |------|---------|----------------|
-| `kimi_code` | Agentic work in a repository — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `edit` (default `false` = analysis-only), `transport` (`cli`\|`acp`, default `acp`), `background`, `session_id` / `new_session`, `timeout_ms` |
+| `kimi_code` | Agentic work in a repository — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `edit` (default `false` = analysis-only), `background`, `session_id` / `new_session`, `timeout_ms` (floor 30 min) |
 | `kimi_ask` | Stateless question, or independent review when `context` is supplied. Text only — no repo, no edits. | `prompt`*, `context` (switches to verify mode), `role` (reviewer persona), `timeout_ms` |
 | `kimi_sessions` | List/inspect Kimi sessions from the CLI catalog, ACP, or both. | `source` (`cli`\|`acp`\|`all`, default `all`), `work_dir`, `limit` (default `20`) |
-| `kimi_tasks` | Manage background work. | `action` (`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session) |
+| `kimi_tasks` | Manage background work. | `action` (`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session), `mode` (`final`\|`full`), `offset`, `limit` |
 | `kimi_status` | Installation, auth, and diagnostics. | `detail` (`basic`\|`full`), `doctor_target` (`config`\|`tui`), `doctor_path` |
 | `kimi_setup` | Generate/merge the Kimi-hosted MCP config entry for this server. | `scope` (`project`\|`user`), `write` (default `false` = preview only), `project_dir`, `server_name` |
 
 `*` = required.
 
-`kimi_code` supports both the ACP JSON-RPC transport (default) and the native
-CLI transport (`transport: 'cli'`); set `background: true` to track long work as
-a background task.
+`kimi_code` drives Kimi exclusively through the ACP JSON-RPC transport. Set
+`background: true` to track long work as a background task.
 
 ### Experimental (off by default)
 
@@ -113,23 +112,6 @@ Enable with the environment variable `LADDER_EXPERIMENTAL=1`:
 | `kimi_desktop_status` | Read-only Kimi Desktop Work status probe. |
 | `kimi_budget_probe` | Guided budget-separation evidence workflow (does not submit Work tasks). |
 
-## Transports: CLI vs ACP
-
-Both transports can edit files and resume sessions; they differ in robustness
-and how much live progress you can watch.
-
-| | `acp` (default) | `cli` |
-|---|---|---|
-| Model | Persistent JSON-RPC session | One-shot process per call |
-| Robustness on Windows | Heavier, more fragile | Highest |
-| Live progress | Granular (per tool call, plan/TODO steps) | Coarse (streaming-output volume) |
-| Interactive permission prompts | Yes | No |
-| Best for | Watching each action live, mid-run prompts | Plain codegen / analysis |
-
-Rule of thumb: stay on **`acp`** as the default for most work; reach for
-**`cli`** explicitly when you need the most robust one-shot process on Windows
-and can tolerate coarse progress reporting.
-
 ## Background tasks
 
 For long runs, set `background: true` on `kimi_code`. The call returns
@@ -138,17 +120,20 @@ immediately with a task id; poll it with `kimi_tasks`:
 ```jsonc
 // 1. start
 kimi_code { "prompt": "...", "work_dir": "C:\\repo", "edit": true, "background": true }
-// 2. watch — list all, or pass task_id for one
+// 2. watch — list all, or pass task_id for one; returns compact metadata only
 kimi_tasks { "action": "status", "task_id": "task_1" }
-// 3. read the full accumulating transcript (TODO checklist + every action)
-kimi_tasks { "action": "output", "task_id": "task_1" }
-// 4. stop early (kills the Kimi child process)
+// 3. read the final line(s)
+kimi_tasks { "action": "output", "task_id": "task_1", "mode": "final" }
+// 4. or read a paginated slice of the full transcript (TODO checklist + every action)
+kimi_tasks { "action": "output", "task_id": "task_1", "mode": "full", "offset": 0, "limit": 100 }
+// 5. stop early (kills the Kimi child process)
 kimi_tasks { "action": "cancel", "task_id": "task_1" }
 ```
 
 Unlike the single overwriting live-progress line of a foreground call, the task
 log keeps the **full transcript** — every progress event and each TODO snapshot
-as Kimi maintains its plan.
+as Kimi maintains its plan. The `status` action returns only metadata; the body
+is opt-in via `output`.
 
 ## Configuration
 
@@ -157,19 +142,19 @@ as Kimi maintains its plan.
 | Variable | Effect |
 |----------|--------|
 | `LADDER_EXPERIMENTAL=1` | Register the 4 experimental tools. |
-| `KIMICODE_API_KEY` | API key used by `kimi_ask` (alternatively set `api_key` in `~/.kimi-code/config.toml`). |
+| `KIMI_API_KEY` | API key used by `kimi_ask` (alternatively set `api_key` in `~/.kimi-code/config.toml`). `KIMICODE_API_KEY` is also accepted as a legacy name. |
 
 ### Timeouts
 
-Every tool that drives Kimi accepts a `timeout_ms` override. Defaults: CLI
-`kimi_code` 10 min, ACP 2 min, `kimi_ask` 2 min (5 min in verify mode), API
-5 min, CLI admin calls 30 s.
+Every tool that drives Kimi accepts a `timeout_ms` override. Defaults: ACP
+`kimi_code` 30 min (1 800 000 ms) floor — smaller values are raised to the
+floor; `kimi_ask` 2 min (5 min in verify mode); API 5 min; CLI admin calls 30 s.
 
 ## Safety boundaries
 
 - `edit` defaults to `false` (analysis-only intent). On Kimi 0.20.1 the
-  read-only guard for `-p` mode is prompt-enforced (advisory), as the CLI
-  provides no hard read-only flag.
+  read-only guard is prompt-enforced (advisory), because ACP does not provide a
+  hard read-only execution flag.
 - `kimi_export_session` requires an explicit `output_path`, stays within the
   working directory, and excludes the global diagnostic log by default.
 - Desktop Work tools are **experimental and read-only**: they do not read the
@@ -199,11 +184,13 @@ npm run dev        # run the server from source via tsx
   API is configured.
 - **`npx ladder-mcp` seems to hang** — expected; it is the stdio server waiting
   for a client. It is meant to be launched by your MCP client, not by hand.
-- **`kimi_ask` errors about a missing key** — set `KIMICODE_API_KEY` or add
-  `api_key` to `~/.kimi-code/config.toml`.
-- **Need maximum robustness for plain codegen** — choose the explicit `cli`
-  transport; `acp` is the default but is heavier and best reserved for
-  watchable/interactive work.
+- **`kimi_ask` errors about a missing key** — set `KIMI_API_KEY` (legacy
+  `KIMICODE_API_KEY` is also accepted) or add `api_key` to
+  `~/.kimi-code/config.toml`. `kimi_code` does not need this key.
+- **`kimi_code` timed out** — the response includes a `session_id`. Call
+  `kimi_code` again with `new_session=false` and the same `session_id` to
+  continue the same Kimi session. Resume is best-effort and not guaranteed; do
+  not start a new task or perform the work yourself.
 
 ## Project layout
 

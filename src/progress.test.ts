@@ -20,7 +20,7 @@ describe('progress', () => {
     expect(line).toMatch(/^\[\d{2}:\d{2}:\d{2}\] ▸ message: hello$/)
   })
 
-  it('fires a stall event after inactivity and re-arms for the next period', () => {
+  it('fires a stall event after inactivity and backs off instead of looping at a fixed rate', () => {
     vi.useFakeTimers()
     try {
       const events: string[] = []
@@ -30,12 +30,17 @@ describe('progress', () => {
       expect(events.length).toBe(1)
       expect(events[0]).toContain('no activity')
 
+      // After the first stall the delay doubles, so no second event at t=2000.
+      vi.advanceTimersByTime(1000)
+      expect(events.length).toBe(1)
+
+      // A ping resets the backoff, and the next stall fires after the base interval.
       watchdog.ping()
       vi.advanceTimersByTime(1000)
       expect(events.length).toBe(2)
 
       watchdog.stop()
-      vi.advanceTimersByTime(2000)
+      vi.advanceTimersByTime(5000)
       expect(events.length).toBe(2)
     } finally {
       vi.useRealTimers()
@@ -186,6 +191,20 @@ describe('createProgressCoalescer', () => {
     coalescer.add('tool_call', 'Read src/index.ts')
 
     expect(events.map((e) => e.kind)).toEqual(['message', 'tool_call'])
+  })
+
+  it('deduplicates consecutive identical tool events by toolCallId', () => {
+    const events: { kind: string; text: string }[] = []
+    const coalescer = createProgressCoalescer((event) => { events.push({ kind: event.kind, text: event.text }) })
+
+    coalescer.add('tool_call', 'Read src/index.ts', { toolCallId: 't1' })
+    coalescer.add('tool_update', 'Read src/index.ts', { toolCallId: 't1' })
+    coalescer.add('tool_update', 'Read src/index.ts', { toolCallId: 't1' })
+    coalescer.add('tool_call', 'Edit src/types.ts', { toolCallId: 't2' })
+
+    expect(events).toHaveLength(2)
+    expect(events[0].text).toBe('Read src/index.ts')
+    expect(events[1].text).toBe('Edit src/types.ts')
   })
 
   it('does not emit an event for a whitespace-only tail', () => {

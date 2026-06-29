@@ -32,11 +32,20 @@ describe('environment', () => {
     const home = 'C:\\Users\\shers'
     const configPath = path.join(home, '.kimi-code', 'config.toml')
     const auth = loadApiAuth({
-      env: { USERPROFILE: home, PATH: '', KIMICODE_API_KEY: 'from-env' },
+      env: { USERPROFILE: home, PATH: '', KIMI_API_KEY: 'from-env' },
       existsSync: (candidate) => candidate === configPath,
-      readFileSync: () => '[providers.kimi]\napi_key = "${KIMICODE_API_KEY}"\nbase_url = "https://api.kimi.com/coding/v1"\n',
+      readFileSync: () => '[providers.kimi]\napi_key = "${KIMI_API_KEY}"\nbase_url = "https://api.kimi.com/coding/v1"\n',
     })
     expect(auth).toEqual({ apiKey: 'from-env', baseUrl: 'https://api.kimi.com/coding/v1' })
+  })
+
+  it('prefers KIMI_API_KEY over legacy KIMICODE_API_KEY', () => {
+    const home = 'C:\\Users\\shers'
+    const auth = loadApiAuth({
+      env: { USERPROFILE: home, PATH: '', KIMI_API_KEY: 'real-key', KIMICODE_API_KEY: 'legacy-key' },
+      existsSync: () => false,
+    })
+    expect(auth).toEqual({ apiKey: 'real-key', baseUrl: 'https://api.kimi.com/coding/v1' })
   })
 
   const home = 'C:\\Users\\shers'

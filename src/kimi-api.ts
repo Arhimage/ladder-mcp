@@ -1,5 +1,5 @@
 import { loadApiAuth } from './environment.js'
-import { truncateAtBoundary } from './kimi-runner.js'
+import { truncateAtBoundary } from './response.js'
 import { clampTimeout } from './transports/acp.js'
 import type { KimiResult } from './types.js'
 
@@ -25,7 +25,7 @@ export async function runKimiApi(config: KimiApiConfig): Promise<KimiResult> {
     return {
       ok: false,
       text: '',
-      error: 'Kimi Code API key not found. Set KIMICODE_API_KEY or add api_key to ~/.kimi-code/config.toml.',
+      error: 'Kimi Code API key not found. Set KIMI_API_KEY (legacy KIMICODE_API_KEY also accepted) or add api_key to ~/.kimi-code/config.toml. Note: kimi_code works without this key; it is only needed for kimi_ask.',
     }
   }
 

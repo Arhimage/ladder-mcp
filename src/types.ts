@@ -4,6 +4,11 @@ export interface KimiResult {
   thinking?: string
   error?: string
   sessionId?: string
+  resumable?: boolean
+  exitCode?: number
+  exitClass?: string
+  stderrTail?: string
+  affectedFiles?: string[]
   metadata?: Record<string, unknown>
 }
 

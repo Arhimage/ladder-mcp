@@ -4,6 +4,57 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — Remediation milestone
+
+### Breaking
+
+- `kimi_code` is now **ACP-only**. The `transport` parameter and the native
+  CLI one-shot fallback have been removed. The `kimi` binary is still used for
+  `kimi acp` and admin commands (`doctor`, `sessions`, `providers`, `vis`,
+  `export`).
+- `kimi_tasks action=status` now returns **compact metadata only**
+  (`id`, `kind`, `status`, timestamps, truncated `error`, `outputLength`). The
+  full transcript is opt-in via `action=output` with `mode=final|full` and
+  optional `offset`/`limit` pagination.
+
+### Changed
+
+- ACP `kimi_code` timeout now has a **30-minute floor** (1 800 000 ms). Any
+  smaller `timeout_ms` is raised to the floor; larger values are allowed. The
+  floor is defined in a single helper.
+- Timeout responses from `kimi_code` now include a structured envelope with
+  `session_id` and explicit continuation instructions: continue the same
+  session with `new_session=false` and the returned `session_id`; do not start
+  a new task or perform the work yourself. Resume is best-effort and not
+  guaranteed.
+- `kimi_status` now separates **CLI/ACP session auth** (used by `kimi_code`)
+  from **Kimi Code API auth** (used by `kimi_ask`) and reports which tools are
+  available in the current state.
+- `kimi_ask` now reads `KIMI_API_KEY`; `KIMICODE_API_KEY` is still accepted as
+  a legacy fallback. The error message clarifies that `kimi_code` does not
+  need this key.
+- All tool replies now pass through a shared size guard. Large responses are
+  truncated with a notice rather than inlined whole.
+- Synthetic `stall` events are now rate-limited with exponential backoff
+  instead of firing every fixed interval.
+- Consecutive duplicate `tool_call`/`tool_call_update` events are now
+  deduplicated by `toolCallId`.
+- MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`) are now set
+  on every registered tool.
+
+### Fixed
+
+- `kimi_tasks` no longer returns `output` and `outputChunks` simultaneously.
+- Background `kimi_code` progress is written only to the task store; it no
+  longer attempts to notify a closed MCP response channel.
+- Task IDs now include a random suffix to avoid collisions across restarts.
+- Task `error` strings are truncated in status snapshots so a huge stack trace
+  cannot blow the response budget.
+- ACP fs writes are now atomic (temp file + rename).
+- `extractTextDeep` recursion is now depth-bounded.
+- `canonicalizePath` rejects paths whose ancestors do not exist under a real
+  directory instead of returning a potentially-escaping resolved path.
+
 ## [1.1.6] - 2026-06-28
 
 ACP is now the default kimi_code transport.

@@ -19,7 +19,17 @@ describe('task-store', () => {
     expect(snapshot.output).toContain('chunk')
     expect(snapshot.output).toContain('done')
     expect(snapshot.outputChunks).toEqual(['chunk', 'done'])
+    expect(snapshot.outputLength).toBeGreaterThan(0)
     expect(snapshot.metadata).toEqual({ sessionId: 's1' })
+  })
+
+  it('create returns compact metadata without output body', () => {
+    const store = new TaskStore()
+    const task = store.create('test', async () => ({ output: 'done' }))
+
+    expect(task.outputLength).toBe(0)
+    expect('output' in task).toBe(false)
+    expect('outputChunks' in task).toBe(false)
   })
 
   it('marks running tasks cancelled', async () => {
@@ -31,6 +41,23 @@ describe('task-store', () => {
     await delay(0)
     const cancelled = await store.cancel(task.id)
     expect(cancelled?.status).toBe('cancelled')
+  })
+
+  it('cancel returns compact metadata without output body for terminal tasks', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (_signal, append) => {
+      append('secret transcript')
+      return { output: 'done' }
+    })
+    await delay(0)
+    await delay(0)
+
+    const cancelled = await store.cancel(task.id)
+
+    expect(cancelled?.status).toBe('succeeded')
+    expect('output' in cancelled!).toBe(false)
+    expect('outputChunks' in cancelled!).toBe(false)
+    expect(cancelled?.outputLength).toBeGreaterThan(0)
   })
 
   it('marks tasks cancelled even when cancel hook rejects', async () => {
@@ -123,5 +150,65 @@ describe('task-store', () => {
     const snapshot = store.get(task.id)!
     expect(snapshot.output).not.toContain('late')
     expect(snapshot.outputChunks).toEqual(['before', 'done'])
+  })
+
+  it('status snapshot returns only metadata with outputLength', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (_signal, append) => {
+      append('line one')
+      append('line two')
+      return {}
+    })
+    await delay(0)
+    await delay(0)
+    const status = store.status(task.id)!
+    expect(status.outputLength).toBeGreaterThan(0)
+    expect('output' in status).toBe(false)
+  })
+
+  it('output paginates in full mode', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (_signal, append) => {
+      for (let i = 0; i < 5; i++) append(`line ${i}`)
+      return {}
+    })
+    await delay(0)
+    await delay(0)
+    const slice = store.output(task.id, 'full', 1, 2)!
+    expect(slice.lines).toEqual(['line 1', 'line 2'])
+    expect(slice.offset).toBe(1)
+    expect(slice.hasMore).toBe(true)
+  })
+
+  it('output final mode returns the trailing lines', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (_signal, append) => {
+      for (let i = 0; i < 5; i++) append(`line ${i}`)
+      return {}
+    })
+    await delay(0)
+    await delay(0)
+    const slice = store.output(task.id, 'final', 0, 2)!
+    expect(slice.lines).toEqual(['line 3', 'line 4'])
+    expect(slice.hasMore).toBe(true)
+  })
+
+  it('truncates long errors in status snapshot', async () => {
+    const store = new TaskStore()
+    const longError = 'x'.repeat(2000)
+    const task = store.create('test', async () => { throw new Error(longError) })
+    await delay(0)
+    await delay(0)
+    const status = store.status(task.id)!
+    expect(status.error).toContain('[error truncated]')
+    expect(status.error!.length).toBeLessThan(longError.length)
+  })
+
+  it('uses random task ids', async () => {
+    const store = new TaskStore()
+    const t1 = store.create('test', async () => ({}))
+    const t2 = store.create('test', async () => ({}))
+    expect(t1.id).not.toBe(t2.id)
+    expect(t1.id).toMatch(/^task_\d+_[a-z0-9]+$/)
   })
 })
