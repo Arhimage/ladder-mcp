@@ -8,6 +8,12 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 
 ## [1.2.0] - 2026-06-29 — Remediation milestone
 
+### Added
+
+- `kimi_status` now reports the running Ladder_mcp server version at the top of
+  its output, so the live version is verifiable with a single tool call (the MCP
+  `serverInfo.version` is only visible to the host at connect time).
+
 ### Breaking
 
 - `kimi_code` is now **ACP-only**. The `transport` parameter and the native

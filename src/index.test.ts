@@ -401,6 +401,16 @@ describe('kimi_status detail switch', () => {
     expect(result).toEqual(expect.objectContaining({ isError: false }))
   })
 
+  it('reports the ladder-mcp server version', async () => {
+    await loadServer()
+    const { VERSION } = await import('./version.js')
+    const result = await registeredTools.kimi_status.handler({ detail: 'basic' })
+    expect(result).toEqual({
+      content: [{ type: 'text', text: expect.stringContaining(`Version: ${VERSION}`) }],
+      isError: false,
+    })
+  })
+
   it('separates session auth from api auth', async () => {
     await loadServer()
     const result = await registeredTools.kimi_status.handler({ detail: 'basic' })

@@ -323,6 +323,9 @@ server.tool(
     const status = await getKimiStatus()
     const apiConfigured = isApiConfigured()
     const lines = [
+      '## Ladder_mcp server',
+      `- Version: ${VERSION}`,
+      '',
       '## Kimi CLI / ACP session auth',
       `- Installed: ${status.installed ? 'Yes' : 'No'}`,
       `- Binary: ${status.binPath ? `\`${status.binPath}\`` : 'Not found'}`,
