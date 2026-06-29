@@ -417,6 +417,85 @@ describe('acp bidirectional request handling', () => {
     const requestId = JSON.parse(written[0].toString('utf-8')).id as number
     expect(requestId).toBeGreaterThanOrEqual(1_000_000)
   })
+
+  describe('AcpClient read-only enforcement', () => {
+    it('rejects fs write_text_file when allowWrite is false', async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acp-ro-write-test-'))
+      const { client, written, dispatch } = createMockClient()
+      client.workDir = tmpDir
+      client.allowWrite = false
+
+      dispatch([{ jsonrpc: '2.0', id: 1, method: 'fs/write_text_file', params: { sessionId: 's1', path: 'nested/file.txt', content: 'hello acp' } }])
+      await flush()
+
+      const reply = JSON.parse(written[0].toString('utf-8'))
+      expect(reply.id).toBe(1)
+      expect(reply.error?.code).toBe(-32602)
+      expect(reply.error?.message).toContain('read-only mode')
+      await expect(fs.access(path.join(tmpDir, 'nested/file.txt'))).rejects.toThrow()
+      await fs.rm(tmpDir, { recursive: true, force: true })
+    })
+
+    it('selects reject_once option for session/request_permission when allowWrite is false', async () => {
+      const { client, written, dispatch } = createMockClient()
+      client.allowWrite = false
+      dispatch([{
+        jsonrpc: '2.0',
+        id: 42,
+        method: 'session/request_permission',
+        params: {
+          sessionId: 's1',
+          options: [
+            { optionId: 'approve_once', name: 'Approve once', kind: 'allow_once' },
+            { optionId: 'reject_once', name: 'Reject once', kind: 'reject_once' },
+          ],
+          toolCall: { toolCallId: 't1', title: 'Write' },
+        },
+      }])
+      await flush()
+
+      const reply = JSON.parse(written[0].toString('utf-8'))
+      expect(reply.id).toBe(42)
+      expect(reply.result).toEqual({ outcome: { outcome: 'selected', optionId: 'reject_once' } })
+    })
+
+    it('cancels session/request_permission when allowWrite is false and no reject option exists', async () => {
+      const { client, written, dispatch } = createMockClient()
+      client.allowWrite = false
+      dispatch([{
+        jsonrpc: '2.0',
+        id: 42,
+        method: 'session/request_permission',
+        params: {
+          sessionId: 's1',
+          options: [
+            { optionId: 'approve_always', name: 'Always', kind: 'allow_always' },
+          ],
+          toolCall: { toolCallId: 't1', title: 'Write' },
+        },
+      }])
+      await flush()
+
+      const reply = JSON.parse(written[0].toString('utf-8'))
+      expect(reply.id).toBe(42)
+      expect(reply.result).toEqual({ outcome: { outcome: 'cancelled' } })
+    })
+
+    it('writes fs write_text_file when allowWrite is true', async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acp-rw-write-test-'))
+      const { client, written, dispatch } = createMockClient()
+      client.workDir = tmpDir
+
+      dispatch([{ jsonrpc: '2.0', id: 1, method: 'fs/write_text_file', params: { sessionId: 's1', path: 'nested/file.txt', content: 'hello acp' } }])
+      await flush()
+
+      const reply = JSON.parse(written[0].toString('utf-8'))
+      expect(reply.id).toBe(1)
+      expect(reply.result).toEqual({})
+      expect(await fs.readFile(path.join(tmpDir, 'nested/file.txt'), 'utf-8')).toBe('hello acp')
+      await fs.rm(tmpDir, { recursive: true, force: true })
+    })
+  })
 })
 
 describe('acp progress reporting', () => {

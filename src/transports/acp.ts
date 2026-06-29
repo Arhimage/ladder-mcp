@@ -68,6 +68,7 @@ export interface AcpPromptOptions {
   signal?: AbortSignal
   onProgress?: ProgressReporter
   includeThinking?: boolean
+  readOnly?: boolean
 }
 
 export function encodeAcpMessage(message: JsonRpcMessage): Buffer {
@@ -257,6 +258,7 @@ export class AcpClient extends EventEmitter {
   private closing = false
   private resolveClosed?: () => void
   workDir?: string
+  allowWrite = true
   readonly closed: Promise<void>
 
   constructor(timeoutMs = ACP_TIMEOUT_FLOOR_MS) {
@@ -464,6 +466,15 @@ export class AcpClient extends EventEmitter {
         case 'session/request_permission':
         case 'session/requestPermission': {
           const options = Array.isArray(record?.options) ? record.options as Array<Record<string, unknown>> : []
+          if (!this.allowWrite) {
+            const rejected = options.find((o) => o?.kind === 'reject_once' || o?.optionId === 'reject_once' || o?.kind === 'reject')
+            if (rejected && typeof rejected.optionId === 'string') {
+              this.respond(id, { outcome: { outcome: 'selected', optionId: rejected.optionId } })
+            } else {
+              this.respond(id, { outcome: { outcome: 'cancelled' } })
+            }
+            return
+          }
           const approved = options.find((o) => o?.kind === 'allow_once' || o?.optionId === 'approve_once')
           if (!approved || typeof approved.optionId !== 'string') {
             throw new AcpError('no allowed permission option found', JSONRPC_INVALID_PARAMS)
@@ -491,6 +502,9 @@ export class AcpClient extends EventEmitter {
         case 'fs/write_text_file':
         case 'fs/writeFile':
         case 'fs/write_text': {
+          if (!this.allowWrite) {
+            throw new AcpError('read-only mode: file writes are disabled (pass edit=true to allow modifications)', JSONRPC_INVALID_PARAMS)
+          }
           const filePath = await this.resolveSandboxedPath(record?.path)
           const content = typeof record?.content === 'string' ? record.content : String(record?.content ?? '')
           await fs.mkdir(path.dirname(filePath), { recursive: true })
@@ -632,6 +646,7 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
   // The ACP timeout floor is mandatory: Kimi tasks routinely run longer than a
   // couple of minutes, and the wrapper (not the host) owns the timeout.
   const client = new AcpClient(resolveAcpTimeout(options.timeoutMs))
+  client.allowWrite = options.readOnly !== true
   const abort = () => client.close()
   options.signal?.addEventListener('abort', abort, { once: true })
   // Cover the race where the signal aborts between the pre-check above and listener

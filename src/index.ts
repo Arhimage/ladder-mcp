@@ -133,7 +133,7 @@ server.tool(
     work_dir: z.string().describe('Absolute path to the codebase root directory.'),
     session_id: z.string().optional().describe('Explicit Kimi session id to resume.'),
     new_session: z.boolean().optional().describe('Start fresh instead of continuing the last session. Default: false.'),
-    edit: z.boolean().optional().describe('Allow file modifications. Default: false (analysis-only intent). On Kimi 0.20.1 this is prompt-enforced (advisory): when false/omitted the ACP prompt is prefixed with a read-only guard.'),
+    edit: z.boolean().optional().describe('Allow file modifications. Default: false (analysis-only). When false/omitted the ACP bridge enforces read-only: it prepends a read-only guard AND rejects fs writes / mutating tool permissions at the proxy (reads still allowed). Set true to permit edits.'),
     background: z.boolean().optional().describe('Track as a long-running background task. Every progress event (including each action) is appended to the task log, readable via kimi_tasks — the full accumulating transcript, unlike the single overwriting live-progress line of a foreground call.'),
     session_mode: z.enum(['new', 'load', 'resume']).optional().describe("ACP session mode. Default: inferred from session_id/new_session."),
     detail_level: z.enum(['summary', 'normal', 'detailed']).optional(),
@@ -159,6 +159,7 @@ server.tool(
       signal,
       onProgress,
       includeThinking: includeThinkingValue,
+      readOnly: edit !== true,
     })
 
     if (background) {

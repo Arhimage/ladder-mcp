@@ -49,6 +49,12 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
   deduplicated by `toolCallId`.
 - MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`) are now set
   on every registered tool.
+- `kimi_code` with `edit` falsy now enforces read-only at the ACP proxy, not just
+  via an advisory prompt: inbound `fs/write_text_file` requests are rejected with
+  a JSON-RPC error before touching disk, and mutating `session/request_permission`
+  requests are denied (reject option or `cancelled`) instead of auto-approved.
+  Reads stay allowed. This is best-effort hardening within the protocol — a true
+  airtight guarantee still requires OS-level sandboxing of the Kimi process.
 
 ### Fixed
 
