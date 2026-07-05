@@ -6,6 +6,34 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-07-05
+
+### Added
+
+- v1.10 multi-agent support: provider-neutral `agent_ask`, `agent_code`,
+  `agent_status`, and `agent_tasks` tools.
+  - `agent_ask` accepts `provider: kimi|minimax` (default `kimi`) and otherwise
+    mirrors `kimi_ask`. MiniMax is driven by the local `mmx` CLI via
+    `mmx text chat --output json --non-interactive --no-color --timeout <seconds>`.
+  - `agent_code` accepts `provider: kimi|minimax` (default `kimi`) and runs
+    agentic code work. The Kimi path delegates to `runKimiCodeAgent` / ACP. The
+    MiniMax path uses disk sessions under `%USERPROFILE%\.ladder-mcp\minimax\sessions`,
+    a temp messages file for `mmx text chat --messages-file <tmp> --tool <tool-json> ...`,
+    tool execution, and resumable multi-turn loops (max 20 iterations).
+  - `agent_status` reports Kimi and MiniMax/mmx diagnostics side-by-side.
+  - `agent_tasks` wraps the existing task-store semantics for provider-neutral
+    background work.
+- MiniMax adapter (`src/providers/minimax.ts`): resolves the `mmx` CLI (`.exe` or npm `.cmd` shim) on PATH,
+  checks `mmx auth status --output json --non-interactive --no-color` (masking
+  any API keys in the response), runs `mmx text chat`, and parses `text`,
+  `thinking`, and `tool_use` blocks into the shared `AgentResult` type. Size and
+  timeout guards mirror the Kimi ask path.
+
+### Changed
+
+- Default tool surface expanded from 6 to 10 core tools; all existing `kimi_*`
+  names remain unchanged and continue to work.
+
 ## [1.3.0] - 2026-07-05 — Usability milestone
 
 ### Breaking

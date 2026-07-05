@@ -6,6 +6,7 @@ export interface TerminalEnvelope {
   status: 'success' | 'timeout' | 'cancel' | 'error'
   sessionId?: string
   resumable?: boolean
+  resumeToolName?: string
   continuation?: {
     instruction: string
     sessionId?: string
@@ -54,12 +55,51 @@ export function formatTerminalEnvelope(envelope: TerminalEnvelope): string {
   if (envelope.sessionId) parts.push(`Session: ${envelope.sessionId}`)
   if (envelope.resumable !== undefined) parts.push(`Resumable: ${envelope.resumable}`)
   if (envelope.continuation) {
+    const resumeToolName = envelope.resumeToolName ?? 'agent_code'
     parts.push(
       '',
       'CONTINUATION INSTRUCTION:',
       envelope.continuation.instruction,
-      `Resume with: kimi_code${envelope.continuation.sessionId ? ` session_id=${envelope.continuation.sessionId}` : ''}`,
+      `Resume with: ${resumeToolName}${envelope.continuation.sessionId ? ` session_id=${envelope.continuation.sessionId}` : ''}`,
     )
   }
   return parts.join('\n')
+}
+
+export interface TerminalEnvelopeSource {
+  ok: boolean
+  error?: string
+  sessionId?: string
+  resumable?: boolean
+  resumeToolName?: string
+}
+
+export function buildTerminalEnvelope(result: TerminalEnvelopeSource): TerminalEnvelope {
+  const status = result.ok
+    ? 'success'
+    : result.resumable
+      ? 'timeout'
+      : result.error?.toLowerCase().includes('cancel')
+        ? 'cancel'
+        : 'error'
+  const resumeToolName = result.resumeToolName ?? 'agent_code'
+  return {
+    status,
+    sessionId: result.sessionId,
+    resumable: result.resumable,
+    resumeToolName,
+    ...(result.resumable
+      ? {
+          continuation: {
+            instruction:
+              `The run timed out and its process was stopped, but the provider persists session state on disk. Continue the same session by calling ${resumeToolName} again with the session_id below; do not start a new task or do the work yourself. Resume is best-effort.`,
+            sessionId: result.sessionId,
+          },
+        }
+      : {}),
+  }
+}
+
+export function wrapThinking(text: string, thinking: string | undefined, includeThinking: boolean, tag = 'thinking'): string {
+  return thinking && includeThinking ? `<${tag}>\n${thinking}\n</${tag}>\n\n${text}` : text
 }

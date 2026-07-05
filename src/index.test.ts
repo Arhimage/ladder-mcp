@@ -35,12 +35,17 @@ vi.mock('./environment.js', () => ({
     credentialsFound: true,
     apiConfigured: false,
   }),
-  isApiConfigured: vi.fn().mockReturnValue(false),
 }))
 
 vi.mock('./kimi-api.js', () => ({
   runKimiApi: vi.fn().mockResolvedValue({ ok: true, text: 'api response' }),
   isApiConfigured: vi.fn().mockReturnValue(false),
+}))
+
+
+vi.mock('./providers/minimax.js', () => ({
+  getMinimaxStatus: vi.fn().mockResolvedValue({ installed: false, binPath: undefined, version: undefined, authenticated: false, error: 'MiniMax CLI (mmx) was not found on PATH.' }),
+  runMinimaxAsk: vi.fn().mockResolvedValue({ ok: true, text: 'minimax response' }),
 }))
 
 
@@ -137,7 +142,7 @@ describe('tool surface registration', () => {
     })
   })
 
-  it('registers exactly the 6 default intent-first tools', async () => {
+  it('registers the default intent-first tools plus provider-neutral agent tools', async () => {
     await loadServer()
     expect(Object.keys(registeredTools)).toEqual([
       'kimi_code',
@@ -146,6 +151,10 @@ describe('tool surface registration', () => {
       'kimi_tasks',
       'kimi_status',
       'kimi_setup',
+      'agent_ask',
+      'agent_code',
+      'agent_status',
+      'agent_tasks',
     ])
   })
 
@@ -157,7 +166,7 @@ describe('tool surface registration', () => {
     expect(registeredTools.kimi_budget_probe).toBeUndefined()
   })
 
-  it('registers the 4 experimental tools when LADDER_EXPERIMENTAL=1', async () => {
+  it('registers default, agent, and experimental tools when LADDER_EXPERIMENTAL=1', async () => {
     await loadServer({ LADDER_EXPERIMENTAL: '1' })
     expect(Object.keys(registeredTools)).toEqual([
       'kimi_code',
@@ -166,6 +175,10 @@ describe('tool surface registration', () => {
       'kimi_tasks',
       'kimi_status',
       'kimi_setup',
+      'agent_ask',
+      'agent_code',
+      'agent_status',
+      'agent_tasks',
       'kimi_export_session',
       'kimi_visualize_session',
       'kimi_desktop_status',
@@ -282,6 +295,8 @@ describe('kimi_code', () => {
     expect(result).toEqual(expect.objectContaining({ isError: true }))
     expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('CONTINUATION INSTRUCTION') }], isError: true })
     expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('session_id=sess_timeout') }], isError: true })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('Resume with: kimi_code') }], isError: true })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('calling kimi_code again') }], isError: true })
   })
 })
 

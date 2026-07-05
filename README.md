@@ -22,6 +22,10 @@ without hardcoded POSIX assumptions.
 - **Background tasks** — run several Kimi tasks in parallel and wait for each
   with a single blocking `kimi_tasks action=wait` call (no polling loop), with a
   live TODO checklist surfaced as Kimi works.
+- **Multi-agent support** — `agent_ask`, `agent_code`, `agent_status`, and `agent_tasks` add a
+  provider-neutral layer. Use `provider: minimax` to route stateless asks through
+  the local MiniMax `mmx` CLI; Kimi stays the default and all `kimi_*` tools are
+  unchanged.
 - **Independent review** — `kimi_ask` runs stateless questions or a skeptical
   second-opinion review of supplied material (no repo access, no edits).
 - **Session-aware** — list, inspect, and resume Kimi sessions across the CLI
@@ -37,6 +41,7 @@ without hardcoded POSIX assumptions.
 - Node.js ≥ 18
 - Kimi Code CLI installed (`kimi.exe` on PATH or at `~/.kimi-code/bin/kimi.exe`),
   authenticated (`~/.kimi-code/`)
+- (Optional) MiniMax CLI (`mmx` on PATH) for `agent_ask` and `agent_code` with `provider=minimax`
 
 ## Quick start (from npm)
 
@@ -96,6 +101,10 @@ tool to produce/merge a `.kimi-code/mcp.json` entry.
 | `kimi_tasks` | Manage background work. | `action` (`wait`\|`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session), `mode` (`final`\|`full`), `offset`, `limit`, `timeout_ms` (wait) |
 | `kimi_status` | Installation, auth, and diagnostics. | `detail` (`basic`\|`full`), `doctor_target` (`config`\|`tui`), `doctor_path` |
 | `kimi_setup` | Generate/merge the Kimi-hosted MCP config entry for this server. | `scope` (`project`\|`user`), `write` (default `false` = preview only), `project_dir`, `server_name` |
+| `agent_ask` | Provider-neutral stateless question/review. | `prompt`*, `provider` (`kimi`\|`minimax`, default `kimi`), `context`, `role`, `timeout_ms` |
+| `agent_code` | Provider-neutral agentic code work — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `provider` (`kimi`\|`minimax`, default `kimi`), `edit`, `background`, `session_id`, `timeout_ms` |
+| `agent_status` | Installation/auth diagnostics for Kimi and MiniMax together. | `detail` (`basic`\|`full`) |
+| `agent_tasks` | Provider-neutral background-task management (same store as `kimi_tasks`). | `action` (`wait`\|`status`\|`output`\|`cancel`)*, `task_id`, `session_id`, `mode`, `offset`, `limit`, `timeout_ms` |
 
 `*` = required.
 

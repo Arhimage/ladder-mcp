@@ -4,12 +4,13 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
+import { AI_CONSUMER_NOTICE, wrapPrompt } from './code-prompt.js'
 import { maxChars, validateWorkDir } from './input-validation.js'
 import { getKimiStatus } from './environment.js'
 import { runKimiApi, isApiConfigured } from './kimi-api.js'
 import { listSessions } from './session-store.js'
-import { cancelAcpSession, listAcpSessions, runAcpPrompt, ACP_TIMEOUT_FLOOR_MS } from './transports/acp.js'
-import { DEFAULT_TOOL_MAX_CHARS, formatTerminalEnvelope, guardResponse, truncateAtCodePointBoundary, type TerminalEnvelope } from './response.js'
+import { cancelAcpSession, listAcpSessions, ACP_TIMEOUT_FLOOR_MS } from './transports/acp.js'
+import { buildTerminalEnvelope, DEFAULT_TOOL_MAX_CHARS, formatTerminalEnvelope, guardResponse, truncateAtCodePointBoundary, wrapThinking } from './response.js'
 import {
   exportKimiSession,
   getKimiCapabilities,
@@ -22,7 +23,9 @@ import { buildBudgetProbeGuide, getDesktopStatus } from './desktop-work.js'
 import { taskStore } from './task-store.js'
 import { createMcpProgressReporter, formatTaskLogLine } from './progress.js'
 import { VERSION } from './version.js'
-import type { DetailLevel, ProgressEvent } from './types.js'
+import type { ProgressEvent } from './types.js'
+import { registerAgentTools } from './agent-tools.js'
+import { runKimiCodeAgent } from './agent-code-kimi.js'
 
 const server = new McpServer({
   name: 'ladder-mcp',
@@ -30,42 +33,6 @@ const server = new McpServer({
 })
 
 const DEFAULT_TASK_WAIT_TIMEOUT_MS = 20 * 60_000
-
-const FORMAT_INSTRUCTIONS: Record<DetailLevel, string> = {
-  summary: `
-OUTPUT FORMAT CONSTRAINTS:
-- Maximum ~2000 words. Be extremely concise.
-- Use bullet points, not paragraphs.
-- List file paths and one-line descriptions only.
-- No code snippets.
-- Structure: ## Overview -> ## Key Findings -> ## File Index`,
-  normal: `
-OUTPUT FORMAT CONSTRAINTS:
-- Maximum ~5000 words. Be concise but thorough.
-- Use structured sections with markdown headers.
-- Include function/class signatures, not full implementations.
-- Reference file paths and line numbers when useful.
-- Structure: ## Overview -> ## Architecture -> ## Key Findings -> ## File Details`,
-  detailed: `
-OUTPUT FORMAT CONSTRAINTS:
-- Maximum ~15000 words.
-- Include relevant snippets only when they materially help.
-- Explain dependency relationships and data flow.`,
-}
-
-const AI_CONSUMER_NOTICE = `
-IMPORTANT: Your response will be consumed by another AI model with limited context. Prioritize density, concrete file references, and structured markdown.`
-
-function wrapPrompt(prompt: string, detailLevel: DetailLevel): string {
-  return `${prompt}\n${FORMAT_INSTRUCTIONS[detailLevel]}\n${AI_CONSUMER_NOTICE}`
-}
-
-function wrapCodePrompt(prompt: string, detailLevel: DetailLevel, edit: boolean | undefined): string {
-  const editGuard = edit
-    ? 'EDIT MODE: You may modify files when needed to satisfy the request.'
-    : 'READ-ONLY MODE: Do not modify files. Analyze only and report findings.'
-  return `${editGuard}\n\n${wrapPrompt(prompt, detailLevel)}`
-}
 
 function textResponse(text: string, isError = false, maxChars?: number) {
   const guarded = guardResponse(text, maxChars !== undefined ? { maxChars } : undefined)
@@ -88,27 +55,6 @@ function jsonResponse(value: unknown, isError = false, maxChars = DEFAULT_TOOL_M
   const notice = `\n\n---\nJSON truncated by Ladder_mcp size guard (${serialized.length.toLocaleString()} of max ${maxChars.toLocaleString()} chars). Use pagination, filters, or a smaller limit to retrieve the rest as valid JSON.`
   const head = truncateAtCodePointBoundary(serialized, Math.max(0, maxChars - notice.length))
   return { content: [{ type: 'text' as const, text: `${head}${notice}` }], isError }
-}
-
-function buildResponse(text: string, thinking: string | undefined, includeThinking: boolean): string {
-  return thinking && includeThinking ? `<kimi-thinking>\n${thinking}\n</kimi-thinking>\n\n${text}` : text
-}
-
-function buildTerminalEnvelope(result: { ok: boolean; error?: string; sessionId?: string; resumable?: boolean }): TerminalEnvelope {
-  const status = result.ok ? 'success' : result.resumable ? 'timeout' : result.error?.toLowerCase().includes('cancel') ? 'cancel' : 'error'
-  return {
-    status,
-    sessionId: result.sessionId,
-    resumable: result.resumable,
-    ...(result.resumable
-      ? {
-          continuation: {
-            instruction: 'The Kimi run timed out and its process was stopped, but Kimi persists session state on disk. Continue the same session by calling kimi_code again with the session_id below; do not start a new task or do the work yourself. Resume is best-effort.',
-            sessionId: result.sessionId,
-          },
-        }
-      : {}),
-  }
 }
 
 function resolveDefaultServerCommand(): { command: string; args: string[] } {
@@ -136,22 +82,23 @@ server.tool(
     if (workDirError) return textResponse(`Error: ${workDirError}`, true)
     const includeThinkingValue = include_thinking ?? false
     const appendReporter = (append: (text: string) => void) => (event: ProgressEvent) => append(formatTaskLogLine(event))
-    const wrappedPrompt = wrapCodePrompt(prompt, detail_level ?? 'normal', edit)
 
-    const runAcp = async (signal?: AbortSignal, onProgress?: (event: ProgressEvent) => void) => runAcpPrompt({
-      prompt: wrappedPrompt,
-      workDir: work_dir,
-      sessionId: session_id,
-      timeoutMs: timeout_ms,
-      signal,
-      onProgress,
-      includeThinking: includeThinkingValue,
-      readOnly: edit !== true,
-    })
+    const runAgent = async (signal?: AbortSignal, onProgress?: (event: ProgressEvent) => void) =>
+      runKimiCodeAgent({
+        prompt,
+        workDir: work_dir,
+        sessionId: session_id,
+        edit,
+        detailLevel: detail_level ?? 'normal',
+        includeThinking: includeThinkingValue,
+        timeoutMs: timeout_ms,
+        signal,
+        onProgress,
+      })
 
     if (background) {
       const task = taskStore.create('acp-code', async (_signal, append) => {
-        const result = await runAcp(_signal, appendReporter(append))
+        const result = await runAgent(_signal, appendReporter(append))
         if (!result.ok) {
           const resume = result.resumable && result.sessionId
             ? ` (resumable — call kimi_code again with session_id=${result.sessionId})`
@@ -167,10 +114,10 @@ server.tool(
       return jsonResponse(task)
     }
 
-    const result = await runAcp(extra?.signal, createMcpProgressReporter(extra))
-    const envelope = buildTerminalEnvelope(result)
+    const result = await runAgent(extra?.signal, createMcpProgressReporter(extra))
+    const envelope = buildTerminalEnvelope({ ...result, resumeToolName: 'kimi_code' })
     if (result.ok) {
-      const body = buildResponse(result.text, result.thinking, includeThinkingValue)
+      const body = wrapThinking(result.text, result.thinking, includeThinkingValue, 'kimi-thinking')
       const tail = `\n\n${formatTerminalEnvelope(envelope)}`
       const budget = Math.max(0, maxChars(max_output_tokens) - tail.length)
       const guardedBody = guardResponse(body, { maxChars: budget }).text
@@ -200,12 +147,12 @@ server.tool(
       const verifyPrompt = `## Your task\n${focus}\n\n## Material to verify\n${context}\n${AI_CONSUMER_NOTICE}`
       const result = await runKimiApi({ prompt: verifyPrompt, system, timeoutMs: timeout_ms ?? 300_000, maxOutputChars: maxChars(max_output_tokens) })
       if (!result.ok) return textResponse(`Error: ${result.error}`, true)
-      return textResponse(buildResponse(result.text, result.thinking, includeThinkingValue), false, maxChars(max_output_tokens))
+      return textResponse(wrapThinking(result.text, result.thinking, includeThinkingValue, 'kimi-thinking'), false, maxChars(max_output_tokens))
     }
 
     const result = await runKimiApi({ prompt, timeoutMs: timeout_ms ?? 120_000, maxOutputChars: maxChars(max_output_tokens) })
     if (!result.ok) return textResponse(`Error: ${result.error}`, true)
-    return textResponse(buildResponse(result.text, result.thinking, includeThinkingValue), false, maxChars(max_output_tokens))
+    return textResponse(wrapThinking(result.text, result.thinking, includeThinkingValue, 'kimi-thinking'), false, maxChars(max_output_tokens))
   },
 )
 
@@ -395,6 +342,8 @@ server.tool(
     return jsonResponse(result)
   },
 )
+
+registerAgentTools(server)
 
 if (process.env.LADDER_EXPERIMENTAL === '1') {
   server.tool(
