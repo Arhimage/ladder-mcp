@@ -1,7 +1,9 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
-export const DEFAULT_MAX_OUTPUT_CHARS = 60_000
+// Single default shared with DEFAULT_TOOL_MAX_CHARS in response.ts: ~20K tokens,
+// under Claude Code's 25K-token MCP result cap.
+export const DEFAULT_MAX_OUTPUT_CHARS = 80_000
 
 // Convert an untrusted max_output_tokens into a character budget. NaN/Infinity/zero/
 // negative/non-integer would otherwise produce a nonsensical budget (e.g. NaN) handed

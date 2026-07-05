@@ -12,6 +12,9 @@ const MAX_ACP_HEADER_BYTES = 16 * 1024
 const MAX_ACP_METADATA_BYTES = 100 * 1024
 const MAX_ACP_UPDATE_CHUNKS = 10_000
 export const ACP_TIMEOUT_FLOOR_MS = 1_800_000
+// Session setup calls (load/resume) are bookkeeping, not agentic work: they must not
+// inherit the 30-minute prompt timeout, or a wedged setup call blocks a whole slot.
+const SESSION_SETUP_TIMEOUT_MS = 120_000
 const CONTENT_LENGTH_PREFIX_BYTES = 'Content-Length:'.length
 const OUTBOUND_ID_SPACE_START = 1_000_000
 const MAX_FS_READ_BYTES = 8 * 1024 * 1024
@@ -63,7 +66,6 @@ export interface AcpPromptOptions {
   prompt: string
   workDir?: string
   sessionId?: string
-  sessionMode?: 'new' | 'load' | 'resume'
   timeoutMs?: number
   signal?: AbortSignal
   onProgress?: ProgressReporter
@@ -333,12 +335,14 @@ export class AcpClient extends EventEmitter {
     return this.request('session/new', { cwd: workDir ?? process.cwd(), mcpServers: [] })
   }
 
-  loadSession(sessionId: string): Promise<unknown> {
-    return this.request('session/load', { sessionId })
+  loadSession(sessionId: string, workDir?: string): Promise<unknown> {
+    return this.request('session/load', { sessionId, cwd: workDir ?? this.workDir ?? process.cwd() }, SESSION_SETUP_TIMEOUT_MS)
   }
 
-  resumeSession(sessionId: string): Promise<unknown> {
-    return this.request('session/resume', { sessionId })
+  resumeSession(sessionId: string, workDir?: string): Promise<unknown> {
+    // Kimi's ACP validates `cwd` on session/resume; omitting it fails with
+    // "cwd Invalid input" on some CLI versions.
+    return this.request('session/resume', { sessionId, cwd: workDir ?? this.workDir ?? process.cwd() }, SESSION_SETUP_TIMEOUT_MS)
   }
 
   prompt(sessionId: string | undefined, prompt: string, workDir?: string): Promise<unknown> {
@@ -700,14 +704,23 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
   try {
     client.workDir = options.workDir
     await client.initialize()
-    if (options.sessionId && options.sessionMode === 'load') {
-      sessionId = extractSessionId(await client.loadSession(options.sessionId), options.sessionId)
-    } else if (options.sessionId && options.sessionMode === 'resume') {
-      sessionId = extractSessionId(await client.resumeSession(options.sessionId), options.sessionId)
-    } else if (!options.sessionId) {
-      sessionId = extractSessionId(await client.newSession(options.workDir))
+    if (options.sessionId) {
+      // Resume the existing session; some Kimi CLI versions reject session/resume
+      // (e.g. param validation), so fall back to session/load with the same id.
+      try {
+        sessionId = extractSessionId(await client.resumeSession(options.sessionId, options.workDir), options.sessionId)
+      } catch (resumeError) {
+        if (options.signal?.aborted) throw resumeError
+        try {
+          sessionId = extractSessionId(await client.loadSession(options.sessionId, options.workDir), options.sessionId)
+        } catch (loadError) {
+          const resumeMessage = resumeError instanceof Error ? resumeError.message : String(resumeError)
+          const loadMessage = loadError instanceof Error ? loadError.message : String(loadError)
+          throw new Error(`session resume failed (${resumeMessage}); load fallback also failed (${loadMessage})`)
+        }
+      }
     } else {
-      sessionId = options.sessionId
+      sessionId = extractSessionId(await client.newSession(options.workDir))
     }
 
     const result = await client.prompt(sessionId, options.prompt, options.workDir)
@@ -731,7 +744,9 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
     } catch {
       metadata = { truncated: true, reason: 'result is not JSON-serializable' }
     }
-    const thinking = options.includeThinking && updateText ? thinkingText || undefined : undefined
+    // Return thinking when requested and it is not already serving as the body
+    // (the body falls back to thinkingText when there were no message chunks).
+    const thinking = options.includeThinking && thinkingText && thinkingText !== text ? thinkingText : undefined
     return { ok: true, text: text || '(empty ACP response from Kimi)', thinking, sessionId, metadata }
   } catch (error) {
     const message = options.signal?.aborted

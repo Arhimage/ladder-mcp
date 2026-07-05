@@ -639,6 +639,91 @@ describe('acp progress reporting', () => {
   })
 })
 
+describe('acp session resume', () => {
+  function createResumeMockServer(options: { resumeFails: boolean; loadFails?: boolean }) {
+    const callbacks: Record<string, ((...args: unknown[]) => void)[]> = {}
+    const requests: Array<{ method?: string; params?: Record<string, unknown> }> = []
+    const on = (event: string, cb: (...args: unknown[]) => void) => {
+      callbacks[event] = callbacks[event] ?? []
+      callbacks[event].push(cb)
+    }
+    const proc = {
+      pid: 42,
+      killed: false,
+      kill: vi.fn(),
+      stdin: {
+        write: (chunk: Buffer, callback?: (error?: Error | null) => void) => {
+          const message = JSON.parse(chunk.toString('utf-8').trim()) as { id?: number; method?: string; params?: Record<string, unknown> }
+          requests.push(message)
+          if (message.method === 'initialize') {
+            proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: 1, serverInfo: { name: 'kimi', version: '1.0' }, capabilities: {} } }))
+          } else if (message.method === 'session/resume') {
+            if (options.resumeFails) {
+              proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'cwd Invalid input' } }))
+            } else {
+              proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'sess_resumed' } }))
+            }
+          } else if (message.method === 'session/load') {
+            if (options.loadFails) {
+              proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'load also broken' } }))
+            } else {
+              proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'sess_loaded' } }))
+            }
+          } else if (message.method === 'session/prompt') {
+            proc.emit('data', encodeAcpMessage({ jsonrpc: '2.0', id: message.id, result: { text: 'resumed response' } }))
+          }
+          callback?.(null)
+          return true
+        },
+      },
+      stderr: { on },
+      stdout: { on },
+      on,
+      emit: (event: string, ...args: unknown[]) => {
+        for (const cb of callbacks[event] ?? []) cb(...args)
+      },
+    } as unknown as ReturnType<typeof import('node:child_process').spawn> & { emit: (event: string, ...args: unknown[]) => void }
+    return { proc, requests }
+  }
+
+  it('resumes with cwd and uses the resumed session', async () => {
+    const { proc, requests } = createResumeMockServer({ resumeFails: false })
+    vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const result = await runAcpPrompt({ prompt: 'hello', sessionId: 'sess_1', workDir: 'C:\\repo' })
+
+    expect(result.ok).toBe(true)
+    expect(result.sessionId).toBe('sess_resumed')
+    const resumeRequest = requests.find((r) => r.method === 'session/resume')
+    expect(resumeRequest?.params).toEqual(expect.objectContaining({ sessionId: 'sess_1', cwd: 'C:\\repo' }))
+    expect(requests.some((r) => r.method === 'session/load')).toBe(false)
+  })
+
+  it('falls back to session/load when session/resume fails', async () => {
+    const { proc, requests } = createResumeMockServer({ resumeFails: true })
+    vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const result = await runAcpPrompt({ prompt: 'hello', sessionId: 'sess_1', workDir: 'C:\\repo' })
+
+    expect(result.ok).toBe(true)
+    expect(result.sessionId).toBe('sess_loaded')
+    expect(requests.some((r) => r.method === 'session/resume')).toBe(true)
+    const loadRequest = requests.find((r) => r.method === 'session/load')
+    expect(loadRequest?.params).toEqual(expect.objectContaining({ sessionId: 'sess_1', cwd: 'C:\\repo' }))
+  })
+
+  it('reports both errors when resume and load both fail', async () => {
+    const { proc } = createResumeMockServer({ resumeFails: true, loadFails: true })
+    vi.mocked(spawn).mockReturnValue(proc as unknown as ReturnType<typeof spawn>)
+
+    const result = await runAcpPrompt({ prompt: 'hello', sessionId: 'sess_1', workDir: 'C:\\repo' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('resume failed')
+    expect(result.error).toContain('load fallback also failed')
+  })
+})
+
 describe('acp cancellation', () => {
   it('returns an aborted error when the signal is already aborted', async () => {
     const controller = new AbortController()

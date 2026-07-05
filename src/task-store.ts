@@ -38,6 +38,13 @@ export interface TaskOutputSlice {
 interface TaskRecord extends TaskSnapshot {
   controller: AbortController
   cancel?: () => void | Promise<void>
+  waiters?: Array<() => void>
+}
+
+const TERMINAL_STATUSES: readonly TaskStatus[] = ['succeeded', 'failed', 'cancelled']
+
+export interface TaskWaitResult extends TaskStatusSnapshot {
+  timedOut?: boolean
 }
 
 function randomTaskSuffix(): string {
@@ -86,12 +93,14 @@ export class TaskStore {
         task.status = 'succeeded'
         task.finishedAt = new Date().toISOString()
         task.updatedAt = task.finishedAt
+        this.settleWaiters(task)
       } catch (error) {
         if (controller.signal.aborted) return
         task.status = 'failed'
         task.error = error instanceof Error ? error.message : String(error)
         task.finishedAt = new Date().toISOString()
         task.updatedAt = task.finishedAt
+        this.settleWaiters(task)
       }
     })
 
@@ -159,6 +168,7 @@ export class TaskStore {
     task.finishedAt = new Date().toISOString()
     task.updatedAt = task.finishedAt
     task.controller.abort()
+    this.settleWaiters(task)
     if (task.cancel) {
       try {
         // Bound the cancel hook: a hook that never resolves must not block kimi_task_cancel
@@ -171,6 +181,62 @@ export class TaskStore {
       }
     }
     return this.statusSnapshot(task)
+  }
+
+  // Block until the task reaches a terminal state, `timeoutMs` elapses (resolves
+  // with the current non-terminal status and timedOut=true), or `signal` aborts
+  // (rejects). One wait call replaces a status-polling loop, so a host model does
+  // not burn a turn per poll.
+  wait(id: string, timeoutMs: number, signal?: AbortSignal): Promise<TaskWaitResult | undefined> {
+    const task = this.tasks.get(id)
+    if (!task) return Promise.resolve(undefined)
+    if (TERMINAL_STATUSES.includes(task.status)) return Promise.resolve(this.statusSnapshot(task))
+
+    return new Promise<TaskWaitResult>((resolve, reject) => {
+      const waiters = task.waiters ?? (task.waiters = [])
+      let timer: NodeJS.Timeout | undefined
+      const cleanup = () => {
+        if (timer) clearTimeout(timer)
+        const index = waiters.indexOf(onSettled)
+        if (index >= 0) waiters.splice(index, 1)
+        signal?.removeEventListener('abort', onAbort)
+      }
+      const onSettled = () => {
+        cleanup()
+        resolve(this.statusSnapshot(task))
+      }
+      const onAbort = () => {
+        cleanup()
+        reject(new Error('wait was aborted by the client.'))
+      }
+      waiters.push(onSettled)
+      timer = setTimeout(() => {
+        cleanup()
+        resolve({ ...this.statusSnapshot(task), timedOut: true })
+      }, Math.max(1, timeoutMs))
+      timer.unref?.()
+      if (signal) {
+        if (signal.aborted) {
+          onAbort()
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+    })
+  }
+
+  // Cancel every pending/running task (used on server shutdown so `kimi acp`
+  // children are killed rather than orphaned when the host restarts the server).
+  async cancelAll(): Promise<void> {
+    const active = [...this.tasks.values()].filter((task) => !TERMINAL_STATUSES.includes(task.status))
+    await Promise.all(active.map((task) => this.cancel(task.id)))
+  }
+
+  private settleWaiters(task: TaskRecord): void {
+    const waiters = task.waiters
+    if (!waiters || waiters.length === 0) return
+    // Each waiter's callback removes itself from the live array; iterate a copy.
+    for (const waiter of [...waiters]) waiter()
   }
 
   append(id: string, text: string): void {

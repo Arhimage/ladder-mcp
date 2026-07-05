@@ -211,4 +211,101 @@ describe('task-store', () => {
     expect(t1.id).not.toBe(t2.id)
     expect(t1.id).toMatch(/^task_\d+_[a-z0-9]+$/)
   })
+
+  it('wait resolves when the task succeeds', async () => {
+    const store = new TaskStore()
+    let finish!: () => void
+    const gate = new Promise<void>((resolve) => { finish = resolve })
+    const task = store.create('test', async () => {
+      await gate
+      return { output: 'done' }
+    })
+    const waitPromise = store.wait(task.id, 10_000)
+    finish()
+    const snapshot = await waitPromise
+    expect(snapshot?.status).toBe('succeeded')
+    expect(snapshot?.timedOut).toBeUndefined()
+  })
+
+  it('wait resolves when the task fails', async () => {
+    const store = new TaskStore()
+    let fail!: (error: Error) => void
+    const gate = new Promise<void>((_resolve, reject) => { fail = reject })
+    const task = store.create('test', async () => {
+      await gate
+      return {}
+    })
+    const waitPromise = store.wait(task.id, 10_000)
+    fail(new Error('boom'))
+    const snapshot = await waitPromise
+    expect(snapshot?.status).toBe('failed')
+    expect(snapshot?.error).toBe('boom')
+  })
+
+  it('wait resolves immediately for an already-terminal task', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async () => ({ output: 'done' }))
+    await delay(0)
+    await delay(0)
+    const snapshot = await store.wait(task.id, 10_000)
+    expect(snapshot?.status).toBe('succeeded')
+  })
+
+  it('wait resolves with timedOut=true when the timeout elapses first', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (signal) => {
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      return {}
+    })
+    await delay(0)
+    const snapshot = await store.wait(task.id, 10)
+    expect(snapshot?.status).toBe('running')
+    expect(snapshot?.timedOut).toBe(true)
+    await store.cancel(task.id)
+  })
+
+  it('wait resolves when the task is cancelled', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (signal) => {
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      return {}
+    })
+    await delay(0)
+    const waitPromise = store.wait(task.id, 10_000)
+    await store.cancel(task.id)
+    const snapshot = await waitPromise
+    expect(snapshot?.status).toBe('cancelled')
+  })
+
+  it('wait rejects when the abort signal fires', async () => {
+    const store = new TaskStore()
+    const task = store.create('test', async (signal) => {
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      return {}
+    })
+    await delay(0)
+    const controller = new AbortController()
+    const waitPromise = store.wait(task.id, 10_000, controller.signal)
+    controller.abort()
+    await expect(waitPromise).rejects.toThrow(/aborted/)
+    await store.cancel(task.id)
+  })
+
+  it('wait returns undefined for an unknown task', async () => {
+    const store = new TaskStore()
+    expect(await store.wait('nope', 10)).toBeUndefined()
+  })
+
+  it('cancelAll cancels every pending and running task', async () => {
+    const store = new TaskStore()
+    const tasks = [0, 1, 2].map(() => store.create('test', async (signal) => {
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      return {}
+    }))
+    await delay(0)
+    await store.cancelAll()
+    for (const task of tasks) {
+      expect(store.status(task.id)?.status).toBe('cancelled')
+    }
+  })
 })

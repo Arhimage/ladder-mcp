@@ -6,6 +6,65 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-05 — Usability milestone
+
+### Breaking
+
+- `kimi_code` parameters `new_session` and `session_mode` have been removed.
+  `new_session` was dead: it was declared in the schema but never read by the
+  handler (session behavior was always driven by `session_id` alone), while the
+  continuation instructions misleadingly told callers to pass
+  `new_session=false`. Session mode is now inferred: pass `session_id` to
+  continue a session, omit it to start a new one.
+
+### Added
+
+- `kimi_tasks action=wait`: block in a single call until a background task
+  reaches a terminal state (or `timeout_ms`, default 20 minutes, elapses —
+  then the current status is returned with `timedOut=true`). Returns the status
+  snapshot plus the last log lines. One `wait` call replaces a status-polling
+  loop, so the host model no longer burns a full turn (and its tokens) per poll.
+- Graceful shutdown: when the host closes stdin (or on SIGINT/SIGTERM) all
+  running background tasks are cancelled, so `kimi acp` child processes are
+  killed instead of orphaned when the MCP server restarts.
+
+### Changed
+
+- Response size guard relaxed and unified: the default budget for all tool
+  replies is now 80 000 chars (~20K tokens, under Claude Code's 25K-token MCP
+  result cap), up from 8 000 for service replies and 60 000 for
+  `kimi_code`/`kimi_ask`. Oversized JSON replies are now truncated with a
+  notice (keeping the head of the payload) instead of being discarded entirely.
+  `max_output_tokens` remains as an optional per-call override.
+- Tool descriptions rewritten to match actual behavior: foreground `kimi_code`
+  is documented as the default (blocking, live progress, no token cost while
+  waiting) with `background=true` reserved for parallel tasks; the timeout
+  description no longer claims "the session may still be active" (the process
+  is stopped on timeout; resume works because Kimi persists session state on
+  disk).
+- README updated: read-only enforcement reflects the 1.2.0 hard proxy gate
+  (was still described as advisory), the "persistent ACP session" wording now
+  matches the per-call process model, the background section shows the
+  parallel + `wait` workflow instead of a polling loop, and the stale version
+  pin was dropped in favor of the npm badge.
+- ACP `session/load` and `session/resume` now use a 2-minute setup timeout
+  instead of inheriting the 30-minute prompt timeout.
+
+### Fixed
+
+- ACP `session/resume` now passes `cwd` (some Kimi CLI versions reject the call
+  with "cwd Invalid input" without it) and falls back to `session/load` with
+  the same session id when resume fails; both errors are reported if the
+  fallback also fails.
+- `include_thinking` on `kimi_code` now returns thinking whenever it exists and
+  is not already serving as the response body (previously thinking was dropped
+  whenever there were no assistant message chunks — exactly the case where it
+  was most useful).
+- Removed dead code left over from the deleted CLI transport: the
+  `exitCode`/`exitClass`/`stderrTail`/`affectedFiles` envelope fields and the
+  `crash` status (never produced by the ACP path), and an unused
+  `combineReporters` import.
+
 ## [1.2.0] - 2026-06-29 — Remediation milestone
 
 ### Added

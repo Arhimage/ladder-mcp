@@ -10,17 +10,18 @@ client like Claude Code can run codebase analysis, native sessions, API
 queries, ACP chat, background tasks, and CLI admin/diagnostics — all on Windows
 without hardcoded POSIX assumptions.
 
-> Status: **v1.1.6** ([npm](https://www.npmjs.com/package/ladder-mcp)).
-> Supported platform is **Windows 11 only**.
+> Published on [npm](https://www.npmjs.com/package/ladder-mcp) (version badge
+> above). Supported platform is **Windows 11 only**.
 
 ## Highlights
 
 - **Agentic codegen & analysis** — point Kimi at a repo to read or edit files.
-- **ACP-only transport** — `kimi_code` drives Kimi through the persistent ACP
-  JSON-RPC session, with granular watchable live progress and interactive
-  permission prompts.
-- **Background tasks** — kick off long runs and poll status/output, with a live
-  TODO checklist surfaced as Kimi works.
+- **ACP-only transport** — `kimi_code` drives Kimi over the ACP JSON-RPC
+  protocol (one `kimi acp` process per call; continuity via `session_id`), with
+  granular watchable live progress and interactive permission prompts.
+- **Background tasks** — run several Kimi tasks in parallel and wait for each
+  with a single blocking `kimi_tasks action=wait` call (no polling loop), with a
+  live TODO checklist surfaced as Kimi works.
 - **Independent review** — `kimi_ask` runs stateless questions or a skeptical
   second-opinion review of supplied material (no repo access, no edits).
 - **Session-aware** — list, inspect, and resume Kimi sessions across the CLI
@@ -89,17 +90,20 @@ tool to produce/merge a `.kimi-code/mcp.json` entry.
 
 | Tool | Purpose | Key parameters |
 |------|---------|----------------|
-| `kimi_code` | Agentic work in a repository — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `edit` (default `false` = analysis-only), `background`, `session_id` / `new_session`, `timeout_ms` (floor 30 min) |
+| `kimi_code` | Agentic work in a repository — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `edit` (default `false` = analysis-only), `background`, `session_id` (continue a session), `timeout_ms` (floor 30 min) |
 | `kimi_ask` | Stateless question, or independent review when `context` is supplied. Text only — no repo, no edits. | `prompt`*, `context` (switches to verify mode), `role` (reviewer persona), `timeout_ms` |
 | `kimi_sessions` | List/inspect Kimi sessions from the CLI catalog, ACP, or both. | `source` (`cli`\|`acp`\|`all`, default `all`), `work_dir`, `limit` (default `20`) |
-| `kimi_tasks` | Manage background work. | `action` (`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session), `mode` (`final`\|`full`), `offset`, `limit` |
+| `kimi_tasks` | Manage background work. | `action` (`wait`\|`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session), `mode` (`final`\|`full`), `offset`, `limit`, `timeout_ms` (wait) |
 | `kimi_status` | Installation, auth, and diagnostics. | `detail` (`basic`\|`full`), `doctor_target` (`config`\|`tui`), `doctor_path` |
 | `kimi_setup` | Generate/merge the Kimi-hosted MCP config entry for this server. | `scope` (`project`\|`user`), `write` (default `false` = preview only), `project_dir`, `server_name` |
 
 `*` = required.
 
-`kimi_code` drives Kimi exclusively through the ACP JSON-RPC transport. Set
-`background: true` to track long work as a background task.
+`kimi_code` drives Kimi exclusively through the ACP JSON-RPC transport. Prefer
+the default **foreground** call: it blocks until Kimi finishes, streams live
+progress to clients that render it (Claude Code does), and costs the host model
+nothing while it waits. Set `background: true` only when you need several Kimi
+tasks running in parallel.
 
 ### Experimental (off by default)
 
@@ -114,26 +118,31 @@ Enable with the environment variable `LADDER_EXPERIMENTAL=1`:
 
 ## Background tasks
 
-For long runs, set `background: true` on `kimi_code`. The call returns
-immediately with a task id; poll it with `kimi_tasks`:
+Foreground (the default) is the right choice for a single task: the call blocks,
+live progress is visible, and no tokens are spent while waiting. Use
+`background: true` to run **several Kimi tasks in parallel** — each call returns
+immediately with a task id. Then wait with one blocking call instead of a
+polling loop (every status poll is a full model turn and costs tokens):
 
 ```jsonc
-// 1. start
-kimi_code { "prompt": "...", "work_dir": "C:\\repo", "edit": true, "background": true }
-// 2. watch — list all, or pass task_id for one; returns compact metadata only
-kimi_tasks { "action": "status", "task_id": "task_1" }
-// 3. read the final line(s)
-kimi_tasks { "action": "output", "task_id": "task_1", "mode": "final" }
-// 4. or read a paginated slice of the full transcript (TODO checklist + every action)
+// 1. start two tasks in parallel
+kimi_code { "prompt": "...", "work_dir": "C:\\repo1", "edit": true, "background": true }
+kimi_code { "prompt": "...", "work_dir": "C:\\repo2", "edit": true, "background": true }
+// 2. wait — blocks until the task finishes (or timeout_ms, default 20 min);
+//    returns the status snapshot plus the last log lines
+kimi_tasks { "action": "wait", "task_id": "task_1" }
+// 3. read a paginated slice of the full transcript (TODO checklist + every action)
 kimi_tasks { "action": "output", "task_id": "task_1", "mode": "full", "offset": 0, "limit": 100 }
+// 4. quick non-blocking check — list all, or pass task_id; metadata only
+kimi_tasks { "action": "status" }
 // 5. stop early (kills the Kimi child process)
 kimi_tasks { "action": "cancel", "task_id": "task_1" }
 ```
 
-Unlike the single overwriting live-progress line of a foreground call, the task
-log keeps the **full transcript** — every progress event and each TODO snapshot
-as Kimi maintains its plan. The `status` action returns only metadata; the body
-is opt-in via `output`.
+The task log keeps the **full transcript** — every progress event and each TODO
+snapshot as Kimi maintains its plan. The `status` action returns only metadata;
+the body is opt-in via `output`. On server shutdown all running background
+tasks are cancelled so no `kimi acp` child processes are orphaned.
 
 ## Configuration
 
@@ -152,9 +161,12 @@ floor; `kimi_ask` 2 min (5 min in verify mode); API 5 min; CLI admin calls 30 s.
 
 ## Safety boundaries
 
-- `edit` defaults to `false` (analysis-only intent). On Kimi 0.20.1 the
-  read-only guard is prompt-enforced (advisory), because ACP does not provide a
-  hard read-only execution flag.
+- `edit` defaults to `false` (analysis-only intent). Read-only is enforced at
+  the ACP proxy since 1.2.0: `fs/write_text_file` requests are rejected with a
+  JSON-RPC error before touching disk, and mutating permission requests are
+  denied (reads stay allowed), in addition to the read-only prompt guard. This
+  is best-effort hardening within the protocol — an airtight guarantee would
+  require OS-level sandboxing of the Kimi process.
 - `kimi_export_session` requires an explicit `output_path`, stays within the
   working directory, and excludes the global diagnostic log by default.
 - Desktop Work tools are **experimental and read-only**: they do not read the
@@ -172,7 +184,7 @@ npm run build      # compiles src/ -> dist/ (tests excluded)
 Quick checks:
 
 ```bash
-npm test           # vitest (175 tests)
+npm test           # vitest
 npm run typecheck  # tsc --noEmit (incl. tests)
 npm run dev        # run the server from source via tsx
 ```
@@ -187,10 +199,11 @@ npm run dev        # run the server from source via tsx
 - **`kimi_ask` errors about a missing key** — set `KIMI_API_KEY` (legacy
   `KIMICODE_API_KEY` is also accepted) or add `api_key` to
   `~/.kimi-code/config.toml`. `kimi_code` does not need this key.
-- **`kimi_code` timed out** — the response includes a `session_id`. Call
-  `kimi_code` again with `new_session=false` and the same `session_id` to
-  continue the same Kimi session. Resume is best-effort and not guaranteed; do
-  not start a new task or perform the work yourself.
+- **`kimi_code` timed out** — the Kimi process is stopped on timeout, but Kimi
+  persists session state on disk and the response includes a `session_id`. Call
+  `kimi_code` again with that `session_id` to continue the same Kimi session.
+  Resume is best-effort and not guaranteed; do not start a new task or perform
+  the work yourself.
 
 ## Project layout
 

@@ -90,6 +90,8 @@ const fakeTaskStore = {
   list: vi.fn().mockReturnValue([fakeTask]),
   cancel: vi.fn().mockReturnValue(fakeTask),
   output: vi.fn().mockReturnValue(fakeOutputSlice),
+  wait: vi.fn().mockResolvedValue(fakeTask),
+  cancelAll: vi.fn().mockResolvedValue(undefined),
 }
 
 vi.mock('./task-store.js', () => ({
@@ -168,7 +170,7 @@ describe('kimi_code', () => {
     await loadServer()
     const { runAcpPrompt } = await import('./transports/acp.js')
     const result = await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('hello'), sessionMode: 'new' }))
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('hello'), sessionId: undefined }))
     expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('acp response') }], isError: false })
     expect(result).toEqual({ content: [{ type: 'text', text: expect.not.stringContaining('If this call reports a timeout') }], isError: false })
   })
@@ -225,11 +227,17 @@ describe('kimi_code', () => {
     expect(registeredTools.kimi_code.schema.transport).toBeUndefined()
   })
 
-  it('honors acp session_mode=load', async () => {
+  it('passes session_id through to the ACP transport', async () => {
     await loadServer()
     const { runAcpPrompt } = await import('./transports/acp.js')
-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', session_id: 'sess_1', session_mode: 'load' })
-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess_1', sessionMode: 'load' }))
+    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', session_id: 'sess_1' })
+    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess_1' }))
+  })
+
+  it('has no session_mode or new_session parameters', async () => {
+    await loadServer()
+    expect(registeredTools.kimi_code.schema.session_mode).toBeUndefined()
+    expect(registeredTools.kimi_code.schema.new_session).toBeUndefined()
   })
 
   it('passes onProgress to foreground acp handler', async () => {
@@ -263,8 +271,8 @@ describe('kimi_code', () => {
     vi.mocked(runAcpPrompt).mockResolvedValueOnce({ ok: false, text: '', error: 'ACP request timed out', sessionId: 'sess_timeout', resumable: true })
     const result = await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
     expect(result).toEqual(expect.objectContaining({ isError: true }))
-    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('new_session=false') }], isError: true })
-    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('sess_timeout') }], isError: true })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('CONTINUATION INSTRUCTION') }], isError: true })
+    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('session_id=sess_timeout') }], isError: true })
   })
 })
 
@@ -364,18 +372,42 @@ describe('kimi_tasks dispatch', () => {
     expect(fakeTaskStore.output).toHaveBeenCalledWith('task_1', 'final', 0, 100)
   })
 
-  it('action=output keeps oversized JSON responses parseable', async () => {
+  it('action=output truncates oversized JSON with a notice instead of discarding it', async () => {
     fakeTaskStore.output.mockReturnValueOnce({
       ...fakeOutputSlice,
-      lines: ['x'.repeat(20_000)],
+      lines: ['x'.repeat(120_000)],
       totalLines: 1,
     })
     await loadServer()
     const result = await registeredTools.kimi_tasks.handler({ action: 'output', task_id: 'task_1' }) as { content: [{ text: string }]; isError: boolean }
     expect(result.isError).toBe(false)
-    const parsed = JSON.parse(result.content[0].text) as { truncated?: boolean; message?: string }
-    expect(parsed.truncated).toBe(true)
-    expect(parsed.message).toContain('smaller valid JSON response')
+    expect(result.content[0].text.length).toBeLessThanOrEqual(80_000)
+    // The head of the payload survives; the tail notice explains how to fetch the rest.
+    expect(result.content[0].text).toContain('"lines"')
+    expect(result.content[0].text).toContain('JSON truncated by Ladder_mcp size guard')
+  })
+
+  it('action=wait requires task_id', async () => {
+    await loadServer()
+    const result = await registeredTools.kimi_tasks.handler({ action: 'wait' })
+    expect(result).toEqual({ content: [{ type: 'text', text: 'task_id is required for action=wait.' }], isError: true })
+  })
+
+  it('action=wait blocks on the task store and returns the snapshot with last lines', async () => {
+    await loadServer()
+    const signal = new AbortController().signal
+    const result = await registeredTools.kimi_tasks.handler({ action: 'wait', task_id: 'task_1', timeout_ms: 5_000 }, { signal }) as { content: [{ text: string }]; isError: boolean }
+    expect(fakeTaskStore.wait).toHaveBeenCalledWith('task_1', 5_000, signal)
+    expect(fakeTaskStore.output).toHaveBeenCalledWith('task_1', 'final', 0, 20)
+    expect(result.isError).toBe(false)
+    expect(result.content[0].text).toContain('lastLines')
+  })
+
+  it('action=wait reports unknown tasks', async () => {
+    fakeTaskStore.wait.mockResolvedValueOnce(undefined)
+    await loadServer()
+    const result = await registeredTools.kimi_tasks.handler({ action: 'wait', task_id: 'nope' })
+    expect(result).toEqual({ content: [{ type: 'text', text: 'Task not found: nope' }], isError: true })
   })
 
   it('action=cancel rejects both task_id and session_id', async () => {

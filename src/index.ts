@@ -9,7 +9,7 @@ import { getKimiStatus } from './environment.js'
 import { runKimiApi, isApiConfigured } from './kimi-api.js'
 import { listSessions } from './session-store.js'
 import { cancelAcpSession, listAcpSessions, runAcpPrompt, ACP_TIMEOUT_FLOOR_MS } from './transports/acp.js'
-import { DEFAULT_TOOL_MAX_CHARS, formatTerminalEnvelope, guardResponse, type TerminalEnvelope } from './response.js'
+import { DEFAULT_TOOL_MAX_CHARS, formatTerminalEnvelope, guardResponse, truncateAtCodePointBoundary, type TerminalEnvelope } from './response.js'
 import {
   exportKimiSession,
   getKimiCapabilities,
@@ -20,7 +20,7 @@ import {
 import { generateMcpConfig } from './kimi-mcp-config.js'
 import { buildBudgetProbeGuide, getDesktopStatus } from './desktop-work.js'
 import { taskStore } from './task-store.js'
-import { combineReporters, createMcpProgressReporter, formatTaskLogLine } from './progress.js'
+import { createMcpProgressReporter, formatTaskLogLine } from './progress.js'
 import { VERSION } from './version.js'
 import type { DetailLevel, ProgressEvent } from './types.js'
 
@@ -28,6 +28,8 @@ const server = new McpServer({
   name: 'kimi-code',
   version: VERSION,
 })
+
+const DEFAULT_TASK_WAIT_TIMEOUT_MS = 20 * 60_000
 
 const FORMAT_INSTRUCTIONS: Record<DetailLevel, string> = {
   summary: `
@@ -80,39 +82,28 @@ function jsonResponse(value: unknown, isError = false, maxChars = DEFAULT_TOOL_M
   if (serialized.length <= maxChars) {
     return { content: [{ type: 'text' as const, text: serialized }], isError }
   }
-  return {
-    content: [{
-      type: 'text' as const,
-      text: JSON.stringify({
-        truncated: true,
-        originalChars: serialized.length,
-        maxChars,
-        message: 'JSON response exceeded the size guard. Use pagination, filters, or a smaller limit to retrieve a smaller valid JSON response.',
-      }, null, 2),
-    }],
-    isError,
-  }
+  // Keep the head of the payload instead of discarding it: a truncated JSON body is
+  // no longer parseable, but the leading data is usually the useful part, and the
+  // notice tells the caller how to fetch the rest.
+  const notice = `\n\n---\nJSON truncated by Ladder_mcp size guard (${serialized.length.toLocaleString()} of max ${maxChars.toLocaleString()} chars). Use pagination, filters, or a smaller limit to retrieve the rest as valid JSON.`
+  const head = truncateAtCodePointBoundary(serialized, Math.max(0, maxChars - notice.length))
+  return { content: [{ type: 'text' as const, text: `${head}${notice}` }], isError }
 }
 
 function buildResponse(text: string, thinking: string | undefined, includeThinking: boolean): string {
   return thinking && includeThinking ? `<kimi-thinking>\n${thinking}\n</kimi-thinking>\n\n${text}` : text
 }
 
-function buildTerminalEnvelope(result: { ok: boolean; text?: string; error?: string; sessionId?: string; resumable?: boolean; exitCode?: number; exitClass?: string; stderrTail?: string; affectedFiles?: string[] }): TerminalEnvelope {
+function buildTerminalEnvelope(result: { ok: boolean; error?: string; sessionId?: string; resumable?: boolean }): TerminalEnvelope {
   const status = result.ok ? 'success' : result.resumable ? 'timeout' : result.error?.toLowerCase().includes('cancel') ? 'cancel' : 'error'
   return {
     status,
     sessionId: result.sessionId,
     resumable: result.resumable,
-    exitCode: result.exitCode,
-    exitClass: result.exitClass,
-    stderrTail: result.stderrTail,
-    affectedFiles: result.affectedFiles,
     ...(result.resumable
       ? {
           continuation: {
-            instruction: 'The Kimi session timed out but may still be active. Continue the same session by calling kimi_code with new_session=false and the session_id below; do not start a new task or do the work yourself. Resume is best-effort.',
-            newSession: false,
+            instruction: 'The Kimi run timed out and its process was stopped, but Kimi persists session state on disk. Continue the same session by calling kimi_code again with the session_id below; do not start a new task or do the work yourself. Resume is best-effort.',
             sessionId: result.sessionId,
           },
         }
@@ -127,34 +118,30 @@ function resolveDefaultServerCommand(): { command: string; args: string[] } {
 
 server.tool(
   'kimi_code',
-  `Agentic work in a repository: analyze and edit files through the ACP JSON-RPC transport. If the call times out, the Kimi session may still be active. To continue, call kimi_code again with new_session=false and the session_id returned in the response. Do not start a new task or perform the work yourself. Resume is best-effort and not guaranteed.`,
+  `Agentic work in a repository: analyze and edit files through the ACP JSON-RPC transport. Pass session_id to continue a previous Kimi session; omit it to start a new one. On timeout the Kimi process is stopped, but Kimi persists session state on disk — continue by calling kimi_code again with the session_id returned in the response. Do not start a new task or perform the work yourself. Resume is best-effort and not guaranteed.`,
   {
     prompt: z.string().describe('The analysis or coding prompt for Kimi.'),
     work_dir: z.string().describe('Absolute path to the codebase root directory.'),
-    session_id: z.string().optional().describe('Explicit Kimi session id to resume.'),
-    new_session: z.boolean().optional().describe('Start fresh instead of continuing the last session. Default: false.'),
+    session_id: z.string().optional().describe('Kimi session id to continue (from a previous kimi_code response or kimi_sessions). Omit to start a new session.'),
     edit: z.boolean().optional().describe('Allow file modifications. Default: false (analysis-only). When false/omitted the ACP bridge enforces read-only: it prepends a read-only guard AND rejects fs writes / mutating tool permissions at the proxy (reads still allowed). Set true to permit edits.'),
-    background: z.boolean().optional().describe('Track as a long-running background task. Every progress event (including each action) is appended to the task log, readable via kimi_tasks — the full accumulating transcript, unlike the single overwriting live-progress line of a foreground call.'),
-    session_mode: z.enum(['new', 'load', 'resume']).optional().describe("ACP session mode. Default: inferred from session_id/new_session."),
+    background: z.boolean().optional().describe('Run as a tracked background task; returns a task id immediately. Default false (foreground) is usually better: the call blocks, live progress streams to the client, and waiting costs no tokens. Use background=true only to run several Kimi tasks in parallel — then wait with kimi_tasks action=wait (a single blocking call) instead of polling status in a loop.'),
     detail_level: z.enum(['summary', 'normal', 'detailed']).optional(),
     max_output_tokens: z.number().optional(),
     include_thinking: z.boolean().optional(),
     timeout_ms: z.number().int().positive().optional().describe(`Optional timeout in milliseconds. The ACP transport enforces a floor of ${ACP_TIMEOUT_FLOOR_MS / 60_000} minutes; any smaller value is raised to the floor. Larger values are allowed.`),
   },
   { title: 'Run Kimi agentic code work', destructiveHint: true },
-  async ({ prompt, work_dir, session_id, new_session, edit, background, session_mode, detail_level, max_output_tokens, include_thinking, timeout_ms }, extra) => {
+  async ({ prompt, work_dir, session_id, edit, background, detail_level, max_output_tokens, include_thinking, timeout_ms }, extra) => {
     const workDirError = work_dir ? validateWorkDir(work_dir) : undefined
     if (workDirError) return textResponse(`Error: ${workDirError}`, true)
     const includeThinkingValue = include_thinking ?? false
     const appendReporter = (append: (text: string) => void) => (event: ProgressEvent) => append(formatTaskLogLine(event))
     const wrappedPrompt = wrapCodePrompt(prompt, detail_level ?? 'normal', edit)
 
-    const defaultAcpSessionMode = session_mode ?? (session_id ? 'resume' : 'new')
     const runAcp = async (signal?: AbortSignal, onProgress?: (event: ProgressEvent) => void) => runAcpPrompt({
       prompt: wrappedPrompt,
       workDir: work_dir,
       sessionId: session_id,
-      sessionMode: defaultAcpSessionMode,
       timeoutMs: timeout_ms,
       signal,
       onProgress,
@@ -167,7 +154,7 @@ server.tool(
         const result = await runAcp(_signal, appendReporter(append))
         if (!result.ok) {
           const resume = result.resumable && result.sessionId
-            ? ` (resumable — continue with new_session=false, session_id=${result.sessionId})`
+            ? ` (resumable — call kimi_code again with session_id=${result.sessionId})`
             : ''
           throw new Error(`${result.error ?? 'ACP code task failed'}${resume}`)
         }
@@ -271,17 +258,26 @@ server.tool(
 
 server.tool(
   'kimi_tasks',
-  'Manage background work: status (compact metadata), output (paginated final/full log), or cancel. By default status returns only metadata; the full transcript is opt-in via action=output.',
+  'Manage background work: wait (block in one call until a task finishes — prefer this over polling status in a loop), status (compact metadata), output (paginated final/full log), or cancel. By default status returns only metadata; the full transcript is opt-in via action=output.',
   {
-    action: z.enum(['status', 'output', 'cancel']).describe("Action: 'status' (metadata only), 'output' (paginated body), or 'cancel'."),
-    task_id: z.string().optional().describe('Omit for status to list all tasks. Required for output.'),
+    action: z.enum(['wait', 'status', 'output', 'cancel']).describe("Action: 'wait' (block until the task reaches a terminal state or timeout_ms elapses), 'status' (metadata only), 'output' (paginated body), or 'cancel'."),
+    task_id: z.string().optional().describe('Omit for status to list all tasks. Required for wait and output.'),
     session_id: z.string().optional().describe('Cancel an ACP session instead of a task (action=cancel).'),
     mode: z.enum(['final', 'full']).optional().describe("output mode: 'final' returns the last line(s), 'full' returns a slice. Default: 'full'."),
     offset: z.number().int().min(0).optional().describe("output full-mode: line offset. Default: 0."),
-    limit: z.number().int().min(1).optional().describe("output mode: max lines to return. Default: 100."),
+    limit: z.number().int().min(1).optional().describe("output/wait: max lines to return. Default: 100 (output), 20 (wait)."),
+    timeout_ms: z.number().int().positive().optional().describe('wait: max time to block. On expiry the current non-terminal status is returned with timedOut=true. Default: 20 minutes.'),
   },
   { title: 'Manage background Kimi tasks', destructiveHint: true },
-  async ({ action, task_id, session_id, mode, offset, limit }) => {
+  async ({ action, task_id, session_id, mode, offset, limit, timeout_ms }, extra) => {
+    if (action === 'wait') {
+      if (!task_id) return textResponse('task_id is required for action=wait.', true)
+      const snapshot = await taskStore.wait(task_id, timeout_ms ?? DEFAULT_TASK_WAIT_TIMEOUT_MS, extra?.signal)
+      if (!snapshot) return textResponse(`Task not found: ${task_id}`, true)
+      const tail = taskStore.output(task_id, 'final', 0, limit ?? 20)
+      return jsonResponse({ ...snapshot, lastLines: tail?.lines ?? [] })
+    }
+
     if (action === 'status') {
       if (task_id) {
         const task = taskStore.status(task_id)
@@ -465,5 +461,13 @@ export { server }
 const isMain = process.argv[1] === fileURLToPath(import.meta.url)
 if (isMain) {
   const transport = new StdioServerTransport()
+  // When the host closes our stdin (client shutdown/restart), cancel all running
+  // background tasks so their `kimi acp` children are killed instead of orphaned.
+  const shutdown = () => {
+    void taskStore.cancelAll()
+  }
+  process.stdin.once('close', shutdown)
+  process.once('SIGINT', shutdown)
+  process.once('SIGTERM', shutdown)
   await server.connect(transport)
 }

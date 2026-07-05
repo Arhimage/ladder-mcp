@@ -3,16 +3,11 @@
 // contract and no single reply can blow through the host's token budget.
 
 export interface TerminalEnvelope {
-  status: 'success' | 'timeout' | 'crash' | 'cancel' | 'error'
+  status: 'success' | 'timeout' | 'cancel' | 'error'
   sessionId?: string
   resumable?: boolean
-  exitCode?: number
-  exitClass?: string
-  stderrTail?: string
-  affectedFiles?: string[]
   continuation?: {
     instruction: string
-    newSession: boolean
     sessionId?: string
   }
 }
@@ -22,7 +17,10 @@ export interface ResponseGuardOptions {
   structured?: unknown
 }
 
-export const DEFAULT_TOOL_MAX_CHARS = 8_000
+// ~20K tokens at the ~4 chars/token heuristic — comfortably under the 25K-token
+// cap Claude Code applies to MCP tool results (MAX_MCP_OUTPUT_TOKENS), so the guard
+// only catches pathological outputs instead of forcing routine re-pagination.
+export const DEFAULT_TOOL_MAX_CHARS = 80_000
 const TRUNCATION_NOTICE = '\n\n---\nResponse truncated by Ladder_mcp size guard.'
 
 export function truncateAtCodePointBoundary(text: string, maxChars: number): string {
@@ -55,17 +53,12 @@ export function formatTerminalEnvelope(envelope: TerminalEnvelope): string {
   parts.push(`Status: ${envelope.status}`)
   if (envelope.sessionId) parts.push(`Session: ${envelope.sessionId}`)
   if (envelope.resumable !== undefined) parts.push(`Resumable: ${envelope.resumable}`)
-  if (envelope.exitCode !== undefined) parts.push(`Exit code: ${envelope.exitCode} (${envelope.exitClass ?? 'unknown'})`)
-  if (envelope.stderrTail) parts.push(`stderr tail:\n${envelope.stderrTail}`)
-  if (envelope.affectedFiles && envelope.affectedFiles.length > 0) {
-    parts.push(`Affected files:\n${envelope.affectedFiles.map((f) => `- ${f}`).join('\n')}`)
-  }
   if (envelope.continuation) {
     parts.push(
       '',
       'CONTINUATION INSTRUCTION:',
       envelope.continuation.instruction,
-      `Resume with: new_session=${envelope.continuation.newSession}${envelope.continuation.sessionId ? `, session_id=${envelope.continuation.sessionId}` : ''}`,
+      `Resume with: kimi_code${envelope.continuation.sessionId ? ` session_id=${envelope.continuation.sessionId}` : ''}`,
     )
   }
   return parts.join('\n')
