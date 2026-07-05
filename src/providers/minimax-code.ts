@@ -198,6 +198,12 @@ export async function runMinimaxCode(
 
       const toolResults: MinimaxContentBlock[] = []
       for (const toolUse of toolUses) {
+        const inputPreview = JSON.stringify(toolUse.input ?? {})
+        options.onProgress?.({
+          kind: 'tool_call',
+          text: `${toolUse.name} ${inputPreview.length > 200 ? `${inputPreview.slice(0, 200)}…` : inputPreview}`,
+          at: new Date().toISOString(),
+        })
         const tool: ToolUseRequest = { id: toolUse.id, name: toolUse.name, input: toolUse.input as Record<string, unknown> }
         const result = await runTool({ workDir: options.workDir, edit: options.edit === true, tool })
         toolResults.push({

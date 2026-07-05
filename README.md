@@ -22,10 +22,14 @@ without hardcoded POSIX assumptions.
 - **Background tasks** — run several Kimi tasks in parallel and wait for each
   with a single blocking `kimi_tasks action=wait` call (no polling loop), with a
   live TODO checklist surfaced as Kimi works.
-- **Multi-agent support** — `agent_ask`, `agent_code`, `agent_status`, and `agent_tasks` add a
-  provider-neutral layer. Use `provider: minimax` to route stateless asks through
-  the local MiniMax `mmx` CLI; Kimi stays the default and all `kimi_*` tools are
-  unchanged.
+- **Multi-agent support** — `agent_ask`, `agent_code`, `agent_cycle`,
+  `agent_sessions`, `agent_status`, and `agent_tasks` add a provider-neutral
+  layer over Kimi and the local MiniMax `mmx` CLI. Kimi stays the default and
+  all `kimi_*` tools are unchanged.
+- **Dev cycle** — `agent_cycle` runs an automated coder→reviewer loop (two
+  independent agent sessions) until the reviewer approves or the caller's
+  `max_iterations` budget is spent. This is the recommended way to write code
+  with `provider=minimax`.
 - **Independent review** — `kimi_ask` runs stateless questions or a skeptical
   second-opinion review of supplied material (no repo access, no edits).
 - **Session-aware** — list, inspect, and resume Kimi sessions across the CLI
@@ -102,7 +106,9 @@ tool to produce/merge a `.kimi-code/mcp.json` entry.
 | `kimi_status` | Installation, auth, and diagnostics. | `detail` (`basic`\|`full`), `doctor_target` (`config`\|`tui`), `doctor_path` |
 | `kimi_setup` | Generate/merge the Kimi-hosted MCP config entry for this server. | `scope` (`project`\|`user`), `write` (default `false` = preview only), `project_dir`, `server_name` |
 | `agent_ask` | Provider-neutral stateless question/review. | `prompt`*, `provider` (`kimi`\|`minimax`, default `kimi`), `context`, `role`, `timeout_ms` |
-| `agent_code` | Provider-neutral agentic code work — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `provider` (`kimi`\|`minimax`, default `kimi`), `edit`, `background`, `session_id`, `timeout_ms` |
+| `agent_code` | Provider-neutral agentic code work — analyze and (optionally) edit files. For MiniMax codegen prefer `agent_cycle`. | `prompt`*, `work_dir`*, `provider` (`kimi`\|`minimax`, default `kimi`), `edit`, `background`, `session_id`, `timeout_ms` |
+| `agent_cycle` | Iterative dev cycle: coder agent implements, independent reviewer agent reviews the diff, loop repeats until `VERDICT: APPROVED` or the iteration budget runs out. **Recommended for codegen with `provider=minimax`.** | `prompt`*, `work_dir`*, `max_iterations`* (1–10), `provider` (both roles, default `kimi`), `coder_provider`, `reviewer_provider`, `edit` (default `true`), `background`, `timeout_ms` (per agent run) |
+| `agent_sessions` | List sessions across providers: Kimi (CLI catalog + ACP) and MiniMax (Ladder session store). | `provider` (`kimi`\|`minimax`\|`all`, default `all`), `work_dir`, `limit` |
 | `agent_status` | Installation/auth diagnostics for Kimi and MiniMax together. | `detail` (`basic`\|`full`) |
 | `agent_tasks` | Provider-neutral background-task management (same store as `kimi_tasks`). | `action` (`wait`\|`status`\|`output`\|`cancel`)*, `task_id`, `session_id`, `mode`, `offset`, `limit`, `timeout_ms` |
 
@@ -152,6 +158,39 @@ The task log keeps the **full transcript** — every progress event and each TOD
 snapshot as Kimi maintains its plan. The `status` action returns only metadata;
 the body is opt-in via `output`. On server shutdown all running background
 tasks are cancelled so no `kimi acp` child processes are orphaned.
+
+## Dev cycle (coder ↔ reviewer)
+
+`agent_cycle` automates the "one agent codes, another reviews" loop inside a
+single tool call:
+
+1. The **coder** session implements the task (`edit: true`).
+2. The **reviewer** — a separate, always read-only session — inspects
+   `git diff` plus the coder's report and must end with `VERDICT: APPROVED` or
+   `VERDICT: REVISE` + a numbered fix list.
+3. On REVISE the feedback goes back into the same coder session; the loop
+   repeats until approval or `max_iterations` (set by the caller, 1–10).
+
+Both roles default to one provider (different sessions/dialogues); override
+either role with `coder_provider` / `reviewer_provider` for cross-provider
+review. **For MiniMax codegen this cycle is the recommended mode** — it
+compensates for the single-shot quality gap without burning a second
+provider's quota by default.
+
+```jsonc
+agent_cycle {
+  "prompt": "Add input validation to the /users endpoint",
+  "work_dir": "C:\\repo",
+  "provider": "minimax",
+  "max_iterations": 3
+}
+// or in the background:
+agent_cycle { ...same..., "background": true }
+agent_tasks { "action": "wait", "task_id": "task_1" }
+```
+
+The result includes per-iteration verdicts, the final review, and both session
+ids (`agent_code` + `session_id` continues the coder session manually).
 
 ## Configuration
 

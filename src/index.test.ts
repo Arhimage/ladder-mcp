@@ -153,6 +153,8 @@ describe('tool surface registration', () => {
       'kimi_setup',
       'agent_ask',
       'agent_code',
+      'agent_cycle',
+      'agent_sessions',
       'agent_status',
       'agent_tasks',
     ])
@@ -177,6 +179,8 @@ describe('tool surface registration', () => {
       'kimi_setup',
       'agent_ask',
       'agent_code',
+      'agent_cycle',
+      'agent_sessions',
       'agent_status',
       'agent_tasks',
       'kimi_export_session',

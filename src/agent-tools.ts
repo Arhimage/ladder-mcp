@@ -11,12 +11,15 @@ import {
   guardResponse,
   wrapThinking,
 } from './response.js'
+import { runAgentCycle } from './agent-cycle.js'
 import { runMinimaxCode } from './providers/minimax-code.js'
+import { getMinimaxSessionsDir, listMinimaxSessions } from './providers/minimax-session.js'
 import { runAgentAsk } from './providers/registry.js'
 import { getMinimaxStatus } from './providers/minimax.js'
 import type { ProviderId } from './providers/types.js'
+import { listSessions } from './session-store.js'
 import { taskStore } from './task-store.js'
-import { cancelAcpSession } from './transports/acp.js'
+import { cancelAcpSession, listAcpSessions } from './transports/acp.js'
 import { VERSION } from './version.js'
 import type { ProgressEvent } from './types.js'
 import { createMcpProgressReporter, formatTaskLogLine } from './progress.js'
@@ -130,7 +133,7 @@ export function registerAgentTools(server: McpServer) {
 
   server.tool(
     'agent_code',
-    'Agentic work in a repository: analyze and edit files through a configurable provider. Pass session_id to continue a previous session; omit it to start a new one.',
+    'Agentic work in a repository: analyze and edit files through a configurable provider. Pass session_id to continue a previous session; omit it to start a new one. For code-writing tasks with provider=minimax, prefer agent_cycle (built-in coder/reviewer loop) over a single agent_code call.',
     {
       prompt: z.string().describe('The analysis or coding prompt.'),
       work_dir: z.string().describe('Absolute path to the codebase root directory.'),
@@ -212,6 +215,107 @@ export function registerAgentTools(server: McpServer) {
   )
 
   server.tool(
+    'agent_cycle',
+    'Iterative dev cycle: a coder agent implements, an independent reviewer agent (separate session) reviews the diff, and the loop repeats until the reviewer approves or max_iterations is reached. Recommended for code-writing tasks with provider=minimax. Both roles default to the same provider; override per role with coder_provider/reviewer_provider.',
+    {
+      prompt: z.string().describe('The coding task to implement.'),
+      work_dir: z.string().describe('Absolute path to the codebase root directory.'),
+      max_iterations: z.number().int().min(1).max(10).describe('Maximum coder→reviewer iterations (1-10). The caller controls the budget.'),
+      provider: z.enum(['kimi', 'minimax']).optional().describe("Provider for both roles. Default: 'kimi'."),
+      coder_provider: z.enum(['kimi', 'minimax']).optional().describe('Override the coder provider.'),
+      reviewer_provider: z.enum(['kimi', 'minimax']).optional().describe('Override the reviewer provider.'),
+      edit: z.boolean().optional().describe('Allow the coder to modify files. Default: true (the reviewer is always read-only).'),
+      background: z.boolean().optional().describe('Run as a tracked background task; manage via agent_tasks. Default false (foreground).'),
+      detail_level: z.enum(['summary', 'normal', 'detailed']).optional(),
+      timeout_ms: z.number().int().positive().optional().describe('Timeout per individual agent run (not the whole cycle).'),
+    },
+    { title: 'Run a coder/reviewer dev cycle', destructiveHint: true },
+    async ({ prompt, work_dir, max_iterations, provider, coder_provider, reviewer_provider, edit, background, detail_level, timeout_ms }, extra) => {
+      const workDirError = work_dir ? validateWorkDir(work_dir) : undefined
+      if (workDirError) return textResponse(`Error: ${workDirError}`, true)
+      const baseProvider = (provider ?? 'kimi') as ProviderId
+      const cycleOptions = {
+        prompt,
+        workDir: work_dir,
+        maxIterations: max_iterations,
+        coderProvider: (coder_provider ?? baseProvider) as ProviderId,
+        reviewerProvider: (reviewer_provider ?? baseProvider) as ProviderId,
+        edit,
+        detailLevel: detail_level ?? ('normal' as const),
+        timeoutMs: timeout_ms,
+      }
+      const appendReporter = (append: (text: string) => void) => (event: ProgressEvent) => append(formatTaskLogLine(event))
+
+      if (background) {
+        const task = taskStore.create('agent-cycle', async (signal, append) => {
+          const result = await runAgentCycle({ ...cycleOptions, signal, onProgress: appendReporter(append) })
+          if (!result.ok && result.finalVerdict === 'incomplete') {
+            throw new Error(`${result.error ?? 'agent_cycle failed'}${result.coderSessionId ? ` (coder session: ${result.coderSessionId})` : ''}`)
+          }
+          return {
+            output: result.text,
+            metadata: {
+              finalVerdict: result.finalVerdict,
+              iterationsUsed: result.iterationsUsed,
+              coderSessionId: result.coderSessionId,
+              reviewerSessionId: result.reviewerSessionId,
+            },
+          }
+        })
+        return jsonResponse(task)
+      }
+
+      const result = await runAgentCycle({ ...cycleOptions, signal: extra?.signal, onProgress: createMcpProgressReporter(extra) })
+      const envelope = buildTerminalEnvelope({
+        ok: result.ok,
+        error: result.error,
+        sessionId: result.coderSessionId,
+        resumeToolName: 'agent_code',
+      })
+      const tail = `\n\n${formatTerminalEnvelope(envelope)}${result.reviewerSessionId ? `\nReviewer session: ${result.reviewerSessionId}` : ''}`
+      const budget = Math.max(0, DEFAULT_TOOL_MAX_CHARS - tail.length)
+      const guardedBody = guardResponse(result.text, { maxChars: budget }).text
+      return { content: [{ type: 'text' as const, text: `${guardedBody}${tail}` }], isError: !result.ok }
+    },
+  )
+
+  server.tool(
+    'agent_sessions',
+    'List sessions across providers: Kimi (CLI catalog + ACP) and MiniMax (Ladder-owned session store).',
+    {
+      provider: z.enum(['kimi', 'minimax', 'all']).optional().describe("Provider filter. Default: 'all'."),
+      work_dir: z.string().optional().describe('Filter sessions by working directory path.'),
+      limit: z.number().int().min(1).optional().describe('Max sessions per provider. Default: 20.'),
+    },
+    { title: 'List provider sessions', readOnlyHint: true },
+    async ({ provider, work_dir, limit }) => {
+      const effectiveProvider = provider ?? 'all'
+      const effectiveLimit = limit ?? 20
+      const result: Record<string, unknown> = {}
+
+      if (effectiveProvider === 'minimax' || effectiveProvider === 'all') {
+        result.minimax = await listMinimaxSessions({ workDir: work_dir, limit: effectiveLimit })
+      }
+      if (effectiveProvider === 'kimi' || effectiveProvider === 'all') {
+        const cli = listSessions({ workDir: work_dir, limit: effectiveLimit })
+        const acpResult = await listAcpSessions({ limit: effectiveLimit, workDir: work_dir })
+        let acp: unknown
+        if (acpResult.ok) {
+          try {
+            acp = JSON.parse(acpResult.text) as unknown
+          } catch {
+            acp = { error: 'ACP sessions response is not valid JSON', raw: acpResult.text }
+          }
+        } else {
+          acp = { error: acpResult.error }
+        }
+        result.kimi = { cli, acp }
+      }
+      return jsonResponse(result)
+    },
+  )
+
+  server.tool(
     'agent_status',
     'Installation, auth, and diagnostics for Kimi and MiniMax.',
     {
@@ -241,6 +345,16 @@ export function registerAgentTools(server: McpServer) {
         `- Binary: ${minimax.binPath ? `\`${minimax.binPath}\`` : 'Not found'}`,
         `- Version: ${minimax.version ?? '(unable to detect)'}`,
         `- Authenticated: ${minimax.authenticated ? 'Yes' : 'No'}`,
+      ]
+      if (detail === 'full') {
+        const sessionsDir = getMinimaxSessionsDir()
+        const sessions = await listMinimaxSessions({ limit: 100 })
+        lines.push(
+          `- Sessions dir: \`${sessionsDir}\``,
+          `- Stored sessions: ${sessions.length}${sessions.length ? ` (latest: ${sessions[0].id}, updated ${sessions[0].updatedAt})` : ''}`,
+        )
+      }
+      lines.push(
         '',
         '## Available tools',
         `- kimi_code: ${kimi.installed && kimi.authenticated ? 'available' : 'unavailable (install/authenticate Kimi CLI)'}`,
@@ -248,7 +362,8 @@ export function registerAgentTools(server: McpServer) {
         `- agent_ask (provider=minimax): ${minimax.installed && minimax.authenticated ? 'available' : 'unavailable (install/authenticate mmx CLI)'}`,
         `- agent_code (provider=kimi): ${kimi.installed && kimi.authenticated ? 'available' : 'unavailable (install/authenticate Kimi CLI)'}`,
         `- agent_code (provider=minimax): ${minimax.installed && minimax.authenticated ? 'available' : 'unavailable (install/authenticate mmx CLI)'}`,
-      ]
+        `- agent_cycle: available when the chosen coder/reviewer providers above are available`,
+      )
       if (kimi.error) lines.push('', `Kimi action required: ${kimi.error}`)
       if (minimax.error) lines.push('', `MiniMax action required: ${minimax.error}`)
       return textResponse(lines.join('\n'), Boolean(kimi.error) || Boolean(minimax.error))

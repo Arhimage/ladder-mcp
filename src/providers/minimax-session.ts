@@ -209,6 +209,49 @@ export async function saveMinimaxSession(
   }
 }
 
+export interface MinimaxSessionSummary {
+  id: string
+  workDir: string
+  createdAt: string
+  updatedAt: string
+  messageCount: number
+  title?: string
+}
+
+export async function listMinimaxSessions(
+  options: { workDir?: string; limit?: number; sessionsDir?: string } = {},
+): Promise<MinimaxSessionSummary[]> {
+  const sessionsDir = options.sessionsDir ?? getMinimaxSessionsDir()
+  let entries: string[]
+  try {
+    entries = await fs.readdir(sessionsDir)
+  } catch {
+    return []
+  }
+
+  const summaries: MinimaxSessionSummary[] = []
+  for (const entry of entries) {
+    if (!entry.startsWith(SESSION_ID_PREFIX) || !entry.endsWith(SESSION_FILE_EXTENSION)) continue
+    const sessionId = entry.slice(0, -SESSION_FILE_EXTENSION.length)
+    const loaded = await loadMinimaxSession(sessionId, { sessionsDir })
+    if (!loaded.ok) continue
+    const { session } = loaded
+    if (options.workDir !== undefined && normalizeDir(session.workDir) !== normalizeDir(options.workDir)) continue
+    summaries.push({
+      id: session.id,
+      workDir: session.workDir,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      messageCount: session.messages.length,
+      title: session.title,
+    })
+  }
+
+  summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  const limit = options.limit ?? 20
+  return summaries.slice(0, Math.max(1, limit))
+}
+
 const activeSessionLocks = new Map<string, () => void>()
 
 export function acquireMinimaxSessionLock(sessionId: string): (() => void) | undefined {

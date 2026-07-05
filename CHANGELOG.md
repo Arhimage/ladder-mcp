@@ -6,6 +6,34 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-05
+
+### Added
+
+- `agent_cycle`: iterative coder→reviewer dev cycle. A coder agent implements
+  the task; an independent reviewer agent (separate session, always read-only)
+  inspects the git diff and the coder's report and must end with
+  `VERDICT: APPROVED` or `VERDICT: REVISE`. On REVISE the feedback is fed back
+  into the same coder session; the loop repeats until approval or
+  `max_iterations` (1-10, set by the caller). Both roles default to the same
+  provider (`provider`, default `kimi`) with per-role overrides
+  (`coder_provider` / `reviewer_provider`). Supports `background: true` with
+  the shared task store (`agent_tasks` wait/status/output/cancel).
+  **Recommended over a single `agent_code` call for code-writing tasks with
+  `provider=minimax`.**
+- `agent_sessions`: provider-neutral session listing — Kimi (CLI catalog + ACP)
+  and MiniMax (Ladder-owned store under `~/.ladder-mcp/minimax/sessions`), with
+  `provider`, `work_dir`, and `limit` filters.
+- MiniMax feature parity improvements:
+  - Per-tool-call live progress in the MiniMax agentic loop (tool name +
+    truncated input), matching Kimi's granular progress reporting.
+  - `agent_status detail=full` now reports the MiniMax sessions directory and
+    stored-session count alongside the existing diagnostics.
+
+### Changed
+
+- `agent_code` description now recommends `agent_cycle` for MiniMax codegen.
+
 ## [1.10.0] - 2026-07-05
 
 ### Added
