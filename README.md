@@ -46,7 +46,7 @@ client launches it via `npx`, or you can install the package directly.
 **Claude Code (one command):**
 
 ```bash
-claude mcp add kimi-code -- npx -y ladder-mcp
+claude mcp add ladder-mcp -- npx -y ladder-mcp
 ```
 
 **Or add it manually to your MCP config:**
@@ -54,7 +54,7 @@ claude mcp add kimi-code -- npx -y ladder-mcp
 ```jsonc
 {
   "mcpServers": {
-    "kimi-code": {
+    "ladder-mcp": {
       "command": "npx",
       "args": ["-y", "ladder-mcp"]
     }
@@ -62,7 +62,7 @@ claude mcp add kimi-code -- npx -y ladder-mcp
 }
 ```
 
-Then in Claude Code run `/mcp` (should show `kimi-code: connected`) and call
+Then in Claude Code run `/mcp` (should show `ladder-mcp: connected`) and call
 `kimi_status` to confirm the environment is detected.
 
 > The server speaks MCP over **stdio**: it is launched and managed by the client,
@@ -191,7 +191,7 @@ npm run dev        # run the server from source via tsx
 
 ## Troubleshooting
 
-- **`kimi-code` not connected / tools missing** — run `kimi_status`. It reports
+- **`ladder-mcp` not connected / tools missing** — run `kimi_status`. It reports
   whether the binary, catalog, credentials, and config are found and whether the
   API is configured.
 - **`npx ladder-mcp` seems to hang** — expected; it is the stdio server waiting

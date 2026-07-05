@@ -5,6 +5,13 @@ import * as path from 'node:path'
 import { generateMcpConfig } from './kimi-mcp-config.js'
 
 describe('kimi mcp config generator', () => {
+  it('defaults the server name to ladder-mcp', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ladder-mcp-config-'))
+    const result = generateMcpConfig({ projectDir: root })
+    const servers = (result.config as { mcpServers: Record<string, unknown> }).mcpServers
+    expect(Object.keys(servers)).toEqual(['ladder-mcp'])
+  })
+
   it('previews a project mcp config without writing', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ladder-mcp-config-'))
     const result = generateMcpConfig({ projectDir: root, serverName: 'ladder_test' })

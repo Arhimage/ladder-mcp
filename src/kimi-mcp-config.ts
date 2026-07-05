@@ -109,7 +109,7 @@ export function generateMcpConfig(options: GenerateMcpConfigOptions = {}): Gener
   if (options.write && options.scope !== 'user') {
     assertWritableProjectTarget(options.projectDir ?? process.cwd())
   }
-  const serverName = options.serverName?.trim() || 'ladder_mcp'
+  const serverName = options.serverName?.trim() || 'ladder-mcp'
   if (!/^[a-zA-Z0-9_-]+$/.test(serverName)) {
     throw new Error('server_name must contain only letters, digits, underscores, and hyphens.')
   }

@@ -25,7 +25,7 @@ import { VERSION } from './version.js'
 import type { DetailLevel, ProgressEvent } from './types.js'
 
 const server = new McpServer({
-  name: 'kimi-code',
+  name: 'ladder-mcp',
   version: VERSION,
 })
 

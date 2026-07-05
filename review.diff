@@ -1,0 +1,2258 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bebcdbb..79fa478 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,57 @@ All notable changes to Ladder_mcp are documented here. Format loosely follows
+ [Keep a Changelog](https://keepachangelog.com/); this project uses
+ [Semantic Versioning](https://semver.org/).
+ 
++## [Unreleased] — Remediation milestone
++
++### Breaking
++
++- `kimi_code` is now **ACP-only**. The `transport` parameter and the native
++  CLI one-shot fallback have been removed. The `kimi` binary is still used for
++  `kimi acp` and admin commands (`doctor`, `sessions`, `providers`, `vis`,
++  `export`).
++- `kimi_tasks action=status` now returns **compact metadata only**
++  (`id`, `kind`, `status`, timestamps, truncated `error`, `outputLength`). The
++  full transcript is opt-in via `action=output` with `mode=final|full` and
++  optional `offset`/`limit` pagination.
++
++### Changed
++
++- ACP `kimi_code` timeout now has a **30-minute floor** (1 800 000 ms). Any
++  smaller `timeout_ms` is raised to the floor; larger values are allowed. The
++  floor is defined in a single helper.
++- Timeout responses from `kimi_code` now include a structured envelope with
++  `session_id` and explicit continuation instructions: continue the same
++  session with `new_session=false` and the returned `session_id`; do not start
++  a new task or perform the work yourself. Resume is best-effort and not
++  guaranteed.
++- `kimi_status` now separates **CLI/ACP session auth** (used by `kimi_code`)
++  from **Kimi Code API auth** (used by `kimi_ask`) and reports which tools are
++  available in the current state.
++- `kimi_ask` now reads `KIMI_API_KEY`; `KIMICODE_API_KEY` is still accepted as
++  a legacy fallback. The error message clarifies that `kimi_code` does not
++  need this key.
++- All tool replies now pass through a shared size guard. Large responses are
++  truncated with a notice rather than inlined whole.
++- Synthetic `stall` events are now rate-limited with exponential backoff
++  instead of firing every fixed interval.
++- Consecutive duplicate `tool_call`/`tool_call_update` events are now
++  deduplicated by `toolCallId`.
++- MCP tool annotations (`title`, `readOnlyHint`, `destructiveHint`) are now set
++  on every registered tool.
++
++### Fixed
++
++- `kimi_tasks` no longer returns `output` and `outputChunks` simultaneously.
++- Background `kimi_code` progress is written only to the task store; it no
++  longer attempts to notify a closed MCP response channel.
++- Task IDs now include a random suffix to avoid collisions across restarts.
++- Task `error` strings are truncated in status snapshots so a huge stack trace
++  cannot blow the response budget.
++- ACP fs writes are now atomic (temp file + rename).
++- `extractTextDeep` recursion is now depth-bounded.
++- `canonicalizePath` rejects paths whose ancestors do not exist under a real
++  directory instead of returning a potentially-escaping resolved path.
++
+ ## [1.1.6] - 2026-06-28
+ 
+ ACP is now the default kimi_code transport.
+diff --git a/README.md b/README.md
+index f2fd9a9..ad928e9 100644
+--- a/README.md
++++ b/README.md
+@@ -16,9 +16,9 @@ without hardcoded POSIX assumptions.
+ ## Highlights
+ 
+ - **Agentic codegen & analysis** — point Kimi at a repo to read or edit files.
+-- **Two transports** — persistent **ACP** JSON-RPC (default) with granular,
+-  watchable live progress and interactive permission prompts, or robust one-shot
+-  **CLI**. [Pick one →](#transports-cli-vs-acp)
++- **ACP-only transport** — `kimi_code` drives Kimi through the persistent ACP
++  JSON-RPC session, with granular watchable live progress and interactive
++  permission prompts.
+ - **Background tasks** — kick off long runs and poll status/output, with a live
+   TODO checklist surfaced as Kimi works.
+ - **Independent review** — `kimi_ask` runs stateless questions or a skeptical
+@@ -89,18 +89,17 @@ tool to produce/merge a `.kimi-code/mcp.json` entry.
+ 
+ | Tool | Purpose | Key parameters |
+ |------|---------|----------------|
+-| `kimi_code` | Agentic work in a repository — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `edit` (default `false` = analysis-only), `transport` (`cli`\|`acp`, default `acp`), `background`, `session_id` / `new_session`, `timeout_ms` |
++| `kimi_code` | Agentic work in a repository — analyze and (optionally) edit files. | `prompt`*, `work_dir`*, `edit` (default `false` = analysis-only), `background`, `session_id` / `new_session`, `timeout_ms` (floor 30 min) |
+ | `kimi_ask` | Stateless question, or independent review when `context` is supplied. Text only — no repo, no edits. | `prompt`*, `context` (switches to verify mode), `role` (reviewer persona), `timeout_ms` |
+ | `kimi_sessions` | List/inspect Kimi sessions from the CLI catalog, ACP, or both. | `source` (`cli`\|`acp`\|`all`, default `all`), `work_dir`, `limit` (default `20`) |
+-| `kimi_tasks` | Manage background work. | `action` (`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session) |
++| `kimi_tasks` | Manage background work. | `action` (`status`\|`output`\|`cancel`)*, `task_id`, `session_id` (cancel an ACP session), `mode` (`final`\|`full`), `offset`, `limit` |
+ | `kimi_status` | Installation, auth, and diagnostics. | `detail` (`basic`\|`full`), `doctor_target` (`config`\|`tui`), `doctor_path` |
+ | `kimi_setup` | Generate/merge the Kimi-hosted MCP config entry for this server. | `scope` (`project`\|`user`), `write` (default `false` = preview only), `project_dir`, `server_name` |
+ 
+ `*` = required.
+ 
+-`kimi_code` supports both the ACP JSON-RPC transport (default) and the native
+-CLI transport (`transport: 'cli'`); set `background: true` to track long work as
+-a background task.
++`kimi_code` drives Kimi exclusively through the ACP JSON-RPC transport. Set
++`background: true` to track long work as a background task.
+ 
+ ### Experimental (off by default)
+ 
+@@ -113,23 +112,6 @@ Enable with the environment variable `LADDER_EXPERIMENTAL=1`:
+ | `kimi_desktop_status` | Read-only Kimi Desktop Work status probe. |
+ | `kimi_budget_probe` | Guided budget-separation evidence workflow (does not submit Work tasks). |
+ 
+-## Transports: CLI vs ACP
+-
+-Both transports can edit files and resume sessions; they differ in robustness
+-and how much live progress you can watch.
+-
+-| | `acp` (default) | `cli` |
+-|---|---|---|
+-| Model | Persistent JSON-RPC session | One-shot process per call |
+-| Robustness on Windows | Heavier, more fragile | Highest |
+-| Live progress | Granular (per tool call, plan/TODO steps) | Coarse (streaming-output volume) |
+-| Interactive permission prompts | Yes | No |
+-| Best for | Watching each action live, mid-run prompts | Plain codegen / analysis |
+-
+-Rule of thumb: stay on **`acp`** as the default for most work; reach for
+-**`cli`** explicitly when you need the most robust one-shot process on Windows
+-and can tolerate coarse progress reporting.
+-
+ ## Background tasks
+ 
+ For long runs, set `background: true` on `kimi_code`. The call returns
+@@ -138,17 +120,20 @@ immediately with a task id; poll it with `kimi_tasks`:
+ ```jsonc
+ // 1. start
+ kimi_code { "prompt": "...", "work_dir": "C:\\repo", "edit": true, "background": true }
+-// 2. watch — list all, or pass task_id for one
++// 2. watch — list all, or pass task_id for one; returns compact metadata only
+ kimi_tasks { "action": "status", "task_id": "task_1" }
+-// 3. read the full accumulating transcript (TODO checklist + every action)
+-kimi_tasks { "action": "output", "task_id": "task_1" }
+-// 4. stop early (kills the Kimi child process)
++// 3. read the final line(s)
++kimi_tasks { "action": "output", "task_id": "task_1", "mode": "final" }
++// 4. or read a paginated slice of the full transcript (TODO checklist + every action)
++kimi_tasks { "action": "output", "task_id": "task_1", "mode": "full", "offset": 0, "limit": 100 }
++// 5. stop early (kills the Kimi child process)
+ kimi_tasks { "action": "cancel", "task_id": "task_1" }
+ ```
+ 
+ Unlike the single overwriting live-progress line of a foreground call, the task
+ log keeps the **full transcript** — every progress event and each TODO snapshot
+-as Kimi maintains its plan.
++as Kimi maintains its plan. The `status` action returns only metadata; the body
++is opt-in via `output`.
+ 
+ ## Configuration
+ 
+@@ -157,19 +142,19 @@ as Kimi maintains its plan.
+ | Variable | Effect |
+ |----------|--------|
+ | `LADDER_EXPERIMENTAL=1` | Register the 4 experimental tools. |
+-| `KIMICODE_API_KEY` | API key used by `kimi_ask` (alternatively set `api_key` in `~/.kimi-code/config.toml`). |
++| `KIMI_API_KEY` | API key used by `kimi_ask` (alternatively set `api_key` in `~/.kimi-code/config.toml`). `KIMICODE_API_KEY` is also accepted as a legacy name. |
+ 
+ ### Timeouts
+ 
+-Every tool that drives Kimi accepts a `timeout_ms` override. Defaults: CLI
+-`kimi_code` 10 min, ACP 2 min, `kimi_ask` 2 min (5 min in verify mode), API
+-5 min, CLI admin calls 30 s.
++Every tool that drives Kimi accepts a `timeout_ms` override. Defaults: ACP
++`kimi_code` 30 min (1 800 000 ms) floor — smaller values are raised to the
++floor; `kimi_ask` 2 min (5 min in verify mode); API 5 min; CLI admin calls 30 s.
+ 
+ ## Safety boundaries
+ 
+ - `edit` defaults to `false` (analysis-only intent). On Kimi 0.20.1 the
+-  read-only guard for `-p` mode is prompt-enforced (advisory), as the CLI
+-  provides no hard read-only flag.
++  read-only guard is prompt-enforced (advisory), because ACP does not provide a
++  hard read-only execution flag.
+ - `kimi_export_session` requires an explicit `output_path`, stays within the
+   working directory, and excludes the global diagnostic log by default.
+ - Desktop Work tools are **experimental and read-only**: they do not read the
+@@ -199,11 +184,13 @@ npm run dev        # run the server from source via tsx
+   API is configured.
+ - **`npx ladder-mcp` seems to hang** — expected; it is the stdio server waiting
+   for a client. It is meant to be launched by your MCP client, not by hand.
+-- **`kimi_ask` errors about a missing key** — set `KIMICODE_API_KEY` or add
+-  `api_key` to `~/.kimi-code/config.toml`.
+-- **Need maximum robustness for plain codegen** — choose the explicit `cli`
+-  transport; `acp` is the default but is heavier and best reserved for
+-  watchable/interactive work.
++- **`kimi_ask` errors about a missing key** — set `KIMI_API_KEY` (legacy
++  `KIMICODE_API_KEY` is also accepted) or add `api_key` to
++  `~/.kimi-code/config.toml`. `kimi_code` does not need this key.
++- **`kimi_code` timed out** — the response includes a `session_id`. Call
++  `kimi_code` again with `new_session=false` and the same `session_id` to
++  continue the same Kimi session. Resume is best-effort and not guaranteed; do
++  not start a new task or perform the work yourself.
+ 
+ ## Project layout
+ 
+diff --git a/src/environment.test.ts b/src/environment.test.ts
+index 7cac6b7..651ed40 100644
+--- a/src/environment.test.ts
++++ b/src/environment.test.ts
+@@ -32,13 +32,22 @@ describe('environment', () => {
+     const home = 'C:\\Users\\shers'
+     const configPath = path.join(home, '.kimi-code', 'config.toml')
+     const auth = loadApiAuth({
+-      env: { USERPROFILE: home, PATH: '', KIMICODE_API_KEY: 'from-env' },
++      env: { USERPROFILE: home, PATH: '', KIMI_API_KEY: 'from-env' },
+       existsSync: (candidate) => candidate === configPath,
+-      readFileSync: () => '[providers.kimi]\napi_key = "${KIMICODE_API_KEY}"\nbase_url = "https://api.kimi.com/coding/v1"\n',
++      readFileSync: () => '[providers.kimi]\napi_key = "${KIMI_API_KEY}"\nbase_url = "https://api.kimi.com/coding/v1"\n',
+     })
+     expect(auth).toEqual({ apiKey: 'from-env', baseUrl: 'https://api.kimi.com/coding/v1' })
+   })
+ 
++  it('prefers KIMI_API_KEY over legacy KIMICODE_API_KEY', () => {
++    const home = 'C:\\Users\\shers'
++    const auth = loadApiAuth({
++      env: { USERPROFILE: home, PATH: '', KIMI_API_KEY: 'real-key', KIMICODE_API_KEY: 'legacy-key' },
++      existsSync: () => false,
++    })
++    expect(auth).toEqual({ apiKey: 'real-key', baseUrl: 'https://api.kimi.com/coding/v1' })
++  })
++
+   const home = 'C:\\Users\\shers'
+   const authOptions = (readFileSync: () => string) => ({
+     env: { USERPROFILE: home, PATH: '' },
+diff --git a/src/environment.ts b/src/environment.ts
+index d0320a7..09d38ca 100644
+--- a/src/environment.ts
++++ b/src/environment.ts
+@@ -108,7 +108,9 @@ function readTomlString(raw: string, key: string): string | undefined {
+ export function loadApiAuth(options?: EnvironmentOptions): ApiAuth | null {
+   const env = getEnv(options)
+   const paths = resolveKimiPaths(options)
+-  let apiKey = env.KIMICODE_API_KEY ?? ''
++  // KIMI_API_KEY is the real kimi-code variable; KIMICODE_API_KEY is a legacy
++  // name invented by this wrapper and kept for backward compatibility.
++  let apiKey = env.KIMI_API_KEY ?? env.KIMICODE_API_KEY ?? ''
+   let baseUrl = env.KIMI_BASE_URL ?? ''
+ 
+   if ((!apiKey || !baseUrl) && exists(paths.configPath, options)) {
+diff --git a/src/index.test.ts b/src/index.test.ts
+index 1b74002..eef750d 100644
+--- a/src/index.test.ts
++++ b/src/index.test.ts
+@@ -7,7 +7,8 @@ const registeredTools: Record<
+ 
+ function createMockServer() {
+   return {
+-    tool: vi.fn((name: string, description: string, schema: Record<string, unknown>, handler: (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>) => {
++    tool: vi.fn((name: string, description: string, schema: Record<string, unknown>, ...rest: unknown[]) => {
++      const handler = rest[rest.length - 1] as (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>
+       registeredTools[name] = { description, schema, handler }
+     }),
+   }
+@@ -42,9 +43,7 @@ vi.mock('./kimi-api.js', () => ({
+   isApiConfigured: vi.fn().mockReturnValue(false),
+ }))
+ 
+-vi.mock('./kimi-runner.js', () => ({
+-  runKimi: vi.fn().mockResolvedValue({ ok: true, text: 'cli response', sessionId: 'sess_123' }),
+-}))
++
+ 
+ vi.mock('./session-store.js', () => ({
+   listSessions: vi.fn().mockReturnValue([]),
+@@ -54,6 +53,7 @@ vi.mock('./transports/acp.js', () => ({
+   runAcpPrompt: vi.fn().mockResolvedValue({ ok: true, text: 'acp response' }),
+   listAcpSessions: vi.fn().mockResolvedValue({ ok: true, text: '{"sessions":[]}' }),
+   cancelAcpSession: vi.fn().mockResolvedValue({ ok: true, text: '{}' }),
++  ACP_TIMEOUT_FLOOR_MS: 1_800_000,
+ }))
+ 
+ vi.mock('./transports/cli-admin.js', () => ({
+@@ -65,20 +65,31 @@ vi.mock('./transports/cli-admin.js', () => ({
+ }))
+ 
+ const fakeTask = {
+-  id: 'task_1',
++  id: 'task_1_abcdef',
+   kind: 'test',
+   status: 'pending',
+   createdAt: '2026-01-01T00:00:00.000Z',
+   updatedAt: '2026-01-01T00:00:00.000Z',
+-  output: '',
+-  outputChunks: [],
++  outputLength: 0,
++}
++
++const fakeOutputSlice = {
++  id: 'task_1_abcdef',
++  status: 'pending',
++  mode: 'full',
++  lines: [],
++  offset: 0,
++  totalLines: 0,
++  hasMore: false,
+ }
+ 
+ const fakeTaskStore = {
+   create: vi.fn().mockReturnValue(fakeTask),
+   get: vi.fn().mockReturnValue(fakeTask),
++  status: vi.fn().mockReturnValue(fakeTask),
+   list: vi.fn().mockReturnValue([fakeTask]),
+   cancel: vi.fn().mockReturnValue(fakeTask),
++  output: vi.fn().mockReturnValue(fakeOutputSlice),
+ }
+ 
+ vi.mock('./task-store.js', () => ({
+@@ -157,7 +168,7 @@ describe('kimi_code', () => {
+     await loadServer()
+     const { runAcpPrompt } = await import('./transports/acp.js')
+     const result = await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
+-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'hello', sessionMode: 'new' }))
++    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('hello'), sessionMode: 'new' }))
+     expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('acp response') }], isError: false })
+   })
+ 
+@@ -180,77 +191,44 @@ describe('kimi_code', () => {
+     }
+   })
+ 
+-  it('uses acp transport when requested', async () => {
++  it('passes timeout_ms through to ACP transport', async () => {
+     await loadServer()
+     const { runAcpPrompt } = await import('./transports/acp.js')
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'acp' })
+-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'hello', sessionMode: 'new' }))
++    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', timeout_ms: 30_000 })
++    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 30_000 }))
+   })
+ 
+-  it('passes edit flag to cli transport', async () => {
+-    await loadServer()
+-    const { runKimi } = await import('./kimi-runner.js')
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', edit: true })
+-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ edit: true }))
+-  })
+-
+-  it('honors acp session_mode=load', async () => {
++  it('prefixes ACP prompts with read-only guard by default', async () => {
+     await loadServer()
+     const { runAcpPrompt } = await import('./transports/acp.js')
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'acp', session_id: 'sess_1', session_mode: 'load' })
+-    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess_1', sessionMode: 'load' }))
+-  })
+-
+-  it('tracks background cli work as a task', async () => {
+-    await loadServer()
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', background: true })
+-    expect(fakeTaskStore.create).toHaveBeenCalledWith('cli-code', expect.any(Function))
++    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
++    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('READ-ONLY MODE') }))
+   })
+ 
+-  it('passes onProgress to foreground cli handler', async () => {
++  it('prefixes ACP prompts with edit guard when edit=true', async () => {
+     await loadServer()
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const sendNotification = vi.fn()
+-    await registeredTools.kimi_code.handler(
+-      { prompt: 'hello', work_dir: 'C:\\good', transport: 'cli' },
+-      { sendNotification, _meta: { progressToken: 'token' } },
+-    )
+-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ onProgress: expect.any(Function) }))
++    const { runAcpPrompt } = await import('./transports/acp.js')
++    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', edit: true })
++    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ prompt: expect.stringContaining('EDIT MODE') }))
+   })
+ 
+-  it('passes MCP cancellation signal to foreground cli handler', async () => {
++  it('allows timeout_ms above the ACP floor', async () => {
+     await loadServer()
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const signal = new AbortController().signal
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli' }, { signal })
+-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ signal }))
++    const { runAcpPrompt } = await import('./transports/acp.js')
++    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', timeout_ms: 3_600_000 })
++    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 3_600_000 }))
+   })
+ 
+-  it('appends formatted progress lines to background cli task output', async () => {
++  it('has no cli transport parameter', async () => {
+     await loadServer()
+-    const { runKimi } = await import('./kimi-runner.js')
+-    vi.mocked(runKimi).mockImplementationOnce(async (config) => {
+-      config.onProgress?.({ kind: 'message', text: 'streaming output… (10 chars)', at: '2026-01-01T00:00:00.000Z' })
+-      return { ok: true, text: 'cli response', sessionId: 'sess_123' }
+-    })
+-
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', background: true })
+-    const executor = fakeTaskStore.create.mock.calls[0][1]
+-    const append = vi.fn()
+-    await executor(new AbortController().signal, append)
+-
+-    expect(append).toHaveBeenCalled()
+-    expect(append.mock.calls[0][0]).toContain('message:')
++    expect(registeredTools.kimi_code.schema.transport).toBeUndefined()
+   })
+ 
+-  it('passes cancellation signal to background cli executor', async () => {
++  it('honors acp session_mode=load', async () => {
+     await loadServer()
+-    const { runKimi } = await import('./kimi-runner.js')
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'cli', background: true })
+-    const executor = fakeTaskStore.create.mock.calls[0][1]
+-    const signal = new AbortController().signal
+-    await executor(signal, vi.fn())
+-    expect(runKimi).toHaveBeenCalledWith(expect.objectContaining({ signal }))
++    const { runAcpPrompt } = await import('./transports/acp.js')
++    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', session_id: 'sess_1', session_mode: 'load' })
++    expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess_1', sessionMode: 'load' }))
+   })
+ 
+   it('passes onProgress to foreground acp handler', async () => {
+@@ -258,7 +236,7 @@ describe('kimi_code', () => {
+     const { runAcpPrompt } = await import('./transports/acp.js')
+     const sendNotification = vi.fn()
+     await registeredTools.kimi_code.handler(
+-      { prompt: 'hello', work_dir: 'C:\\good', transport: 'acp' },
++      { prompt: 'hello', work_dir: 'C:\\good' },
+       { sendNotification, _meta: { progressToken: 'token' } },
+     )
+     expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ onProgress: expect.any(Function) }))
+@@ -268,7 +246,7 @@ describe('kimi_code', () => {
+     await loadServer()
+     const { runAcpPrompt } = await import('./transports/acp.js')
+     const signal = new AbortController().signal
+-    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', transport: 'acp' }, { signal })
++    await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' }, { signal })
+     expect(runAcpPrompt).toHaveBeenCalledWith(expect.objectContaining({ signal }))
+   })
+ 
+@@ -277,6 +255,16 @@ describe('kimi_code', () => {
+     await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good', background: true })
+     expect(fakeTaskStore.create).toHaveBeenCalledWith('acp-code', expect.any(Function))
+   })
++
++  it('includes continuation instruction and session_id in timeout response', async () => {
++    await loadServer()
++    const { runAcpPrompt } = await import('./transports/acp.js')
++    vi.mocked(runAcpPrompt).mockResolvedValueOnce({ ok: false, text: '', error: 'ACP request timed out', sessionId: 'sess_timeout', resumable: true })
++    const result = await registeredTools.kimi_code.handler({ prompt: 'hello', work_dir: 'C:\\good' })
++    expect(result).toEqual(expect.objectContaining({ isError: true }))
++    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('new_session=false') }], isError: true })
++    expect(result).toEqual({ content: [{ type: 'text', text: expect.stringContaining('sess_timeout') }], isError: true })
++  })
+ })
+ 
+ describe('kimi_ask', () => {
+@@ -345,10 +333,16 @@ describe('kimi_tasks dispatch', () => {
+     expect(fakeTaskStore.list).toHaveBeenCalled()
+   })
+ 
+-  it('action=status gets one task when task_id provided', async () => {
++  it('action=status gets compact metadata when task_id provided', async () => {
+     await loadServer()
+     await registeredTools.kimi_tasks.handler({ action: 'status', task_id: 'task_1' })
+-    expect(fakeTaskStore.get).toHaveBeenCalledWith('task_1')
++    expect(fakeTaskStore.status).toHaveBeenCalledWith('task_1')
++  })
++
++  it('action=status snapshot does not include output body', async () => {
++    await loadServer()
++    const result = await registeredTools.kimi_tasks.handler({ action: 'status', task_id: 'task_1' })
++    expect(result).toEqual({ content: [{ type: 'text', text: expect.not.stringContaining('"output"') }], isError: false })
+   })
+ 
+   it('action=output requires task_id', async () => {
+@@ -357,6 +351,18 @@ describe('kimi_tasks dispatch', () => {
+     expect(result).toEqual({ content: [{ type: 'text', text: 'task_id is required for action=output.' }], isError: true })
+   })
+ 
++  it('action=output paginates full mode', async () => {
++    await loadServer()
++    await registeredTools.kimi_tasks.handler({ action: 'output', task_id: 'task_1', mode: 'full', offset: 10, limit: 50 })
++    expect(fakeTaskStore.output).toHaveBeenCalledWith('task_1', 'full', 10, 50)
++  })
++
++  it('action=output supports final mode', async () => {
++    await loadServer()
++    await registeredTools.kimi_tasks.handler({ action: 'output', task_id: 'task_1', mode: 'final' })
++    expect(fakeTaskStore.output).toHaveBeenCalledWith('task_1', 'final', 0, 100)
++  })
++
+   it('action=cancel rejects both task_id and session_id', async () => {
+     await loadServer()
+     const result = await registeredTools.kimi_tasks.handler({ action: 'cancel', task_id: 'task_1', session_id: 'sess_1' })
+@@ -380,6 +386,19 @@ describe('kimi_status detail switch', () => {
+     expect(result).toEqual(expect.objectContaining({ isError: false }))
+   })
+ 
++  it('separates session auth from api auth', async () => {
++    await loadServer()
++    const result = await registeredTools.kimi_status.handler({ detail: 'basic' })
++    expect(result).toEqual({
++      content: [{ type: 'text', text: expect.stringContaining('Session authenticated (for kimi_code)') }],
++      isError: false,
++    })
++    expect(result).toEqual({
++      content: [{ type: 'text', text: expect.stringContaining('Kimi Code API auth (for kimi_ask)') }],
++      isError: false,
++    })
++  })
++
+   it('detail=full adds capabilities, doctor, and providers', async () => {
+     await loadServer()
+     const { getKimiCapabilities, runKimiDoctor, listKimiProviders } = await import('./transports/cli-admin.js')
+diff --git a/src/index.ts b/src/index.ts
+index 1f7f084..31e8ba1 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -7,9 +7,9 @@ import { z } from 'zod'
+ import { maxChars, validateWorkDir } from './input-validation.js'
+ import { getKimiStatus } from './environment.js'
+ import { runKimiApi, isApiConfigured } from './kimi-api.js'
+-import { runKimi } from './kimi-runner.js'
+ import { listSessions } from './session-store.js'
+-import { cancelAcpSession, listAcpSessions, runAcpPrompt } from './transports/acp.js'
++import { cancelAcpSession, listAcpSessions, runAcpPrompt, ACP_TIMEOUT_FLOOR_MS } from './transports/acp.js'
++import { formatTerminalEnvelope, guardResponse, type TerminalEnvelope } from './response.js'
+ import {
+   exportKimiSession,
+   getKimiCapabilities,
+@@ -58,14 +58,47 @@ function wrapPrompt(prompt: string, detailLevel: DetailLevel): string {
+   return `${prompt}\n${FORMAT_INSTRUCTIONS[detailLevel]}\n${AI_CONSUMER_NOTICE}`
+ }
+ 
+-function textResponse(text: string, isError = false) {
+-  return { content: [{ type: 'text' as const, text }], isError }
++function wrapCodePrompt(prompt: string, detailLevel: DetailLevel, edit: boolean | undefined): string {
++  const editGuard = edit
++    ? 'EDIT MODE: You may modify files when needed to satisfy the request.'
++    : 'READ-ONLY MODE: Do not modify files. Analyze only and report findings.'
++  return `${editGuard}\n\n${wrapPrompt(prompt, detailLevel)}`
++}
++
++function textResponse(text: string, isError = false, maxChars?: number) {
++  const guarded = guardResponse(text, maxChars !== undefined ? { maxChars } : undefined)
++  return { content: [{ type: 'text' as const, text: guarded.text }], isError }
+ }
+ 
+ function buildResponse(text: string, thinking: string | undefined, includeThinking: boolean): string {
+   return thinking && includeThinking ? `<kimi-thinking>\n${thinking}\n</kimi-thinking>\n\n${text}` : text
+ }
+ 
++const CONTINUATION_NOTICE = (sessionId?: string) =>
++  `If this call reports a timeout, the Kimi session may be resumable. To continue the same session, call kimi_code again with new_session=false${sessionId ? ` and session_id=${sessionId}` : ' and the returned session_id'}. Do not start a new task or perform the work yourself. Resume is best-effort and not guaranteed.`
++
++function buildTerminalEnvelope(result: { ok: boolean; text?: string; error?: string; sessionId?: string; resumable?: boolean; exitCode?: number; exitClass?: string; stderrTail?: string; affectedFiles?: string[] }): TerminalEnvelope {
++  const status = result.ok ? 'success' : result.resumable ? 'timeout' : result.error?.toLowerCase().includes('cancel') ? 'cancel' : 'error'
++  return {
++    status,
++    sessionId: result.sessionId,
++    resumable: result.resumable,
++    exitCode: result.exitCode,
++    exitClass: result.exitClass,
++    stderrTail: result.stderrTail,
++    affectedFiles: result.affectedFiles,
++    ...(result.resumable
++      ? {
++          continuation: {
++            instruction: 'The Kimi session timed out but may still be active. Continue the same session by calling kimi_code with new_session=false and the session_id below; do not start a new task or do the work yourself. Resume is best-effort.',
++            newSession: false,
++            sessionId: result.sessionId,
++          },
++        }
++      : {}),
++  }
++}
++
+ function resolveDefaultServerCommand(): { command: string; args: string[] } {
+   const distIndex = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'index.js')
+   return { command: process.execPath, args: [distIndex] }
+@@ -73,80 +106,43 @@ function resolveDefaultServerCommand(): { command: string; args: string[] } {
+ 
+ server.tool(
+   'kimi_code',
+-  'Agentic work in a repository: analyze and edit files. Defaults to ACP transport.',
++  `Agentic work in a repository: analyze and edit files through the ACP JSON-RPC transport. If the call times out, the Kimi session may still be active. To continue, call kimi_code again with new_session=false and the session_id returned in the response. Do not start a new task or perform the work yourself. Resume is best-effort and not guaranteed.`,
+   {
+     prompt: z.string().describe('The analysis or coding prompt for Kimi.'),
+     work_dir: z.string().describe('Absolute path to the codebase root directory.'),
+     session_id: z.string().optional().describe('Explicit Kimi session id to resume.'),
+     new_session: z.boolean().optional().describe('Start fresh instead of continuing the last session. Default: false.'),
+-    edit: z.boolean().optional().describe('Allow file modifications. Default: false (analysis-only intent). On Kimi 0.20.1 this is prompt-enforced (advisory): when false/omitted the prompt is prefixed with a read-only guard, but the CLI itself provides no hard read-only flag for -p mode.'),
++    edit: z.boolean().optional().describe('Allow file modifications. Default: false (analysis-only intent). On Kimi 0.20.1 this is prompt-enforced (advisory): when false/omitted the ACP prompt is prefixed with a read-only guard.'),
+     background: z.boolean().optional().describe('Track as a long-running background task. Every progress event (including each action) is appended to the task log, readable via kimi_tasks — the full accumulating transcript, unlike the single overwriting live-progress line of a foreground call.'),
+-    transport: z.enum(['cli', 'acp']).optional().describe("How the server drives Kimi. Both edit files and resume sessions; they differ in robustness and live-progress detail. 'acp' (default): persistent JSON-RPC session that emits granular live progress (tool calls, plan steps) and supports interactive permission prompts, but is heavier and more fragile. 'cli': one-shot process, most robust on Windows, but live progress is coarse — only streaming-output volume, no per-action lines. Prefer 'acp' as the default for most work; choose 'cli' explicitly when you need the most robust one-shot process on Windows."),
+-    session_mode: z.enum(['new', 'load', 'resume']).optional().describe("ACP session mode when transport='acp'. Default: inferred from session_id/new_session."),
++    session_mode: z.enum(['new', 'load', 'resume']).optional().describe("ACP session mode. Default: inferred from session_id/new_session."),
+     detail_level: z.enum(['summary', 'normal', 'detailed']).optional(),
+     max_output_tokens: z.number().optional(),
+     include_thinking: z.boolean().optional(),
+-    timeout_ms: z.number().int().positive().optional(),
++    timeout_ms: z.number().int().positive().optional().describe(`Optional timeout in milliseconds. The ACP transport enforces a floor of ${ACP_TIMEOUT_FLOOR_MS / 60_000} minutes; any smaller value is raised to the floor. Larger values are allowed.`),
+   },
+-  async ({ prompt, work_dir, session_id, new_session, edit, background, transport, session_mode, detail_level, max_output_tokens, include_thinking, timeout_ms }, extra) => {
++  { title: 'Run Kimi agentic code work', destructiveHint: true },
++  async ({ prompt, work_dir, session_id, new_session, edit, background, session_mode, detail_level, max_output_tokens, include_thinking, timeout_ms }, extra) => {
+     const workDirError = work_dir ? validateWorkDir(work_dir) : undefined
+     if (workDirError) return textResponse(`Error: ${workDirError}`, true)
+     const includeThinkingValue = include_thinking ?? false
+-    const effectiveTransport = transport ?? 'acp'
+     const appendReporter = (append: (text: string) => void) => (event: ProgressEvent) => append(formatTaskLogLine(event))
+-
+-    if (effectiveTransport === 'cli') {
+-      if (background) {
+-        const task = taskStore.create('cli-code', async (_signal, append) => {
+-          const result = await runKimi({
+-            prompt: wrapPrompt(prompt, detail_level ?? 'normal'),
+-            workDir: work_dir,
+-            sessionId: session_id,
+-            continueLast: !session_id && new_session !== true,
+-            edit,
+-            timeoutMs: timeout_ms ?? 600_000,
+-            maxOutputChars: maxChars(max_output_tokens),
+-            includeThinking: includeThinkingValue,
+-            onProgress: appendReporter(append),
+-            signal: _signal,
+-          })
+-          if (!result.ok) throw new Error(result.error ?? 'CLI code task failed')
+-          return { output: result.text, metadata: { sessionId: result.sessionId } }
+-        })
+-        return textResponse(JSON.stringify(task, null, 2))
+-      }
+-
+-      const result = await runKimi({
+-        prompt: wrapPrompt(prompt, detail_level ?? 'normal'),
+-        workDir: work_dir,
+-        sessionId: session_id,
+-        continueLast: !session_id && new_session !== true,
+-        edit,
+-        timeoutMs: timeout_ms ?? 600_000,
+-        maxOutputChars: maxChars(max_output_tokens),
+-        includeThinking: includeThinkingValue,
+-        onProgress: createMcpProgressReporter(extra),
+-        signal: extra?.signal,
+-      })
+-      if (!result.ok) return textResponse(`Error: ${result.error}`, true)
+-      const sessionLine = result.sessionId ? `\n\nSession: ${result.sessionId}` : ''
+-      return textResponse(`${buildResponse(result.text, result.thinking, includeThinkingValue)}${sessionLine}`)
+-    }
++    const wrappedPrompt = wrapCodePrompt(prompt, detail_level ?? 'normal', edit)
+ 
+     const defaultAcpSessionMode = session_mode ?? (session_id ? 'resume' : 'new')
+     const runAcp = async (signal?: AbortSignal, onProgress?: (event: ProgressEvent) => void) => runAcpPrompt({
+-      prompt,
++      prompt: wrappedPrompt,
+       workDir: work_dir,
+       sessionId: session_id,
+       sessionMode: defaultAcpSessionMode,
+       timeoutMs: timeout_ms,
+       signal,
+       onProgress,
++      includeThinking: includeThinkingValue,
+     })
+ 
+     if (background) {
+       const task = taskStore.create('acp-code', async (_signal, append) => {
+-        const result = await runAcp(_signal, combineReporters(appendReporter(append), createMcpProgressReporter(extra)))
++        const result = await runAcp(_signal, appendReporter(append))
+         if (!result.ok) throw new Error(result.error ?? 'ACP code task failed')
+         const metadata = { ...(result.metadata ?? {}) }
+         if (!('sessionId' in metadata)) {
+@@ -158,7 +154,11 @@ server.tool(
+     }
+ 
+     const result = await runAcp(extra?.signal, createMcpProgressReporter(extra))
+-    return textResponse(JSON.stringify(result, null, 2), !result.ok)
++    const envelope = buildTerminalEnvelope(result)
++    const responseText = result.ok
++      ? `${buildResponse(result.text, result.thinking, includeThinkingValue)}\n\n${formatTerminalEnvelope(envelope)}${CONTINUATION_NOTICE(result.sessionId)}`
++      : `${formatTerminalEnvelope(envelope)}\n\nError: ${result.error}`
++    return textResponse(responseText, !result.ok, maxChars(max_output_tokens))
+   },
+ )
+ 
+@@ -173,6 +173,7 @@ server.tool(
+     include_thinking: z.boolean().optional(),
+     timeout_ms: z.number().int().positive().optional(),
+   },
++  { title: 'Ask Kimi a stateless question', readOnlyHint: true },
+   async ({ prompt, context, role, max_output_tokens, include_thinking, timeout_ms }) => {
+     const includeThinkingValue = include_thinking ?? false
+     if (context) {
+@@ -198,6 +199,7 @@ server.tool(
+     limit: z.number().optional().describe('Max sessions to return. Default: 20.'),
+     source: z.enum(['cli', 'acp', 'all']).optional().describe("Source: 'cli', 'acp', or 'all'. Default: 'all'."),
+   },
++  { title: 'List Kimi sessions', readOnlyHint: true },
+   async ({ work_dir, limit, source }) => {
+     const effectiveSource = source ?? 'all'
+     const effectiveLimit = limit ?? 20
+@@ -233,16 +235,20 @@ server.tool(
+ 
+ server.tool(
+   'kimi_tasks',
+-  'Manage background work: status, output, or cancel.',
++  'Manage background work: status (compact metadata), output (paginated final/full log), or cancel. By default status returns only metadata; the full transcript is opt-in via action=output.',
+   {
+-    action: z.enum(['status', 'output', 'cancel']).describe("Action: 'status', 'output', or 'cancel'."),
++    action: z.enum(['status', 'output', 'cancel']).describe("Action: 'status' (metadata only), 'output' (paginated body), or 'cancel'."),
+     task_id: z.string().optional().describe('Omit for status to list all tasks. Required for output.'),
+     session_id: z.string().optional().describe('Cancel an ACP session instead of a task (action=cancel).'),
++    mode: z.enum(['final', 'full']).optional().describe("output mode: 'final' returns the last line(s), 'full' returns a slice. Default: 'full'."),
++    offset: z.number().int().min(0).optional().describe("output full-mode: line offset. Default: 0."),
++    limit: z.number().int().min(1).optional().describe("output mode: max lines to return. Default: 100."),
+   },
+-  async ({ action, task_id, session_id }) => {
++  { title: 'Manage background Kimi tasks', readOnlyHint: true },
++  async ({ action, task_id, session_id, mode, offset, limit }) => {
+     if (action === 'status') {
+       if (task_id) {
+-        const task = taskStore.get(task_id)
++        const task = taskStore.status(task_id)
+         return textResponse(task ? JSON.stringify(task, null, 2) : `Task not found: ${task_id}`, !task)
+       }
+       return textResponse(JSON.stringify(taskStore.list(), null, 2))
+@@ -250,12 +256,12 @@ server.tool(
+ 
+     if (action === 'output') {
+       if (!task_id) return textResponse('task_id is required for action=output.', true)
+-      const task = taskStore.get(task_id)
++      const slice = taskStore.output(task_id, mode ?? 'full', offset ?? 0, limit ?? 100)
+       return textResponse(
+-        task
+-          ? JSON.stringify({ id: task.id, status: task.status, output: task.output, outputChunks: task.outputChunks, error: task.error }, null, 2)
++        slice
++          ? JSON.stringify(slice, null, 2)
+           : `Task not found: ${task_id}`,
+-        !task,
++        !slice,
+       )
+     }
+ 
+@@ -282,21 +288,28 @@ server.tool(
+     doctor_target: z.enum(['config', 'tui']).optional().describe("Target for the doctor subcall when detail='full'. Default: 'config'."),
+     doctor_path: z.string().optional().describe("Optional config/tui path for the doctor subcall when detail='full'."),
+   },
++  { title: 'Kimi installation and auth diagnostics', readOnlyHint: true },
+   async ({ detail, doctor_target, doctor_path }) => {
+     const status = await getKimiStatus()
++    const apiConfigured = isApiConfigured()
+     const lines = [
+-      '## Kimi CLI Status',
++      '## Kimi CLI / ACP session auth',
+       `- Installed: ${status.installed ? 'Yes' : 'No'}`,
+       `- Binary: ${status.binPath ? `\`${status.binPath}\`` : 'Not found'}`,
+       `- Version: ${status.version ?? '(unable to detect)'}`,
+-      `- Authenticated: ${status.authenticated ? 'Yes' : 'No'}`,
++      `- Session authenticated (for kimi_code): ${status.authenticated ? 'Yes' : 'No'}`,
+       `- Catalog Found: ${status.catalogFound ? 'Yes' : 'No'}`,
+       `- Catalog: \`${status.catalogPath}\``,
+       `- Credentials Found: ${status.credentialsFound ? 'Yes' : 'No'}`,
+       `- Config Found: ${status.configFound ? 'Yes' : 'No'}`,
+       '',
+-      '## Kimi Code API',
+-      `- Configured: ${isApiConfigured() ? 'Yes' : 'No'}`,
++      '## Kimi Code API auth (for kimi_ask)',
++      `- Configured: ${apiConfigured ? 'Yes' : 'No'}`,
++      '',
++      '## Available tools in this state',
++      `- kimi_code: ${status.installed && status.authenticated ? 'available' : 'unavailable (install/authenticate Kimi CLI)'}`,
++      `- kimi_ask: ${apiConfigured ? 'available' : 'unavailable (set KIMI_API_KEY or api_key in ~/.kimi-code/config.toml)'}`,
++      `- kimi_sessions, kimi_tasks, kimi_status, kimi_setup: ${status.installed ? 'available' : 'unavailable'}`,
+     ]
+     if (status.error) lines.push('', `Action required: ${status.error}`)
+ 
+@@ -338,6 +351,7 @@ server.tool(
+     command: z.string().optional(),
+     args: z.array(z.string()).optional(),
+   },
++  { title: 'Generate Kimi MCP config entry', destructiveHint: true },
+   async ({ scope, project_dir, server_name, write, command, args }) => {
+     const defaults = resolveDefaultServerCommand()
+     const result = generateMcpConfig({
+@@ -362,6 +376,7 @@ if (process.env.LADDER_EXPERIMENTAL === '1') {
+       include_global_log: z.boolean().optional().describe('Include active global diagnostic log. Default: false.'),
+       overwrite_existing: z.boolean().optional().describe('Overwrite output_path if it already exists. Default: false.'),
+     },
++    { title: 'Export Kimi session ZIP', destructiveHint: true },
+     async ({ output_path, session_id, include_global_log, overwrite_existing }) => {
+       const result = await exportKimiSession({
+         outputPath: output_path,
+@@ -382,6 +397,7 @@ if (process.env.LADDER_EXPERIMENTAL === '1') {
+       port: z.number().int().min(1).max(65535).optional().describe('Port to bind. Default: 58628.'),
+       launch: z.boolean().optional().describe('Actually start the visualizer process. Default: false.'),
+     },
++    { title: 'Launch Kimi session visualizer', destructiveHint: true },
+     async ({ session_id, host, port, launch }) => {
+       try {
+         return textResponse(JSON.stringify(visualizeSession({ sessionId: session_id, host, port, launch }), null, 2))
+@@ -395,6 +411,7 @@ if (process.env.LADDER_EXPERIMENTAL === '1') {
+     'kimi_desktop_status',
+     'Experimental read-only Kimi Desktop Work status probe. Does not read token stores or replay web auth.',
+     {},
++    { title: 'Read Kimi Desktop Work status', readOnlyHint: true },
+     async () => textResponse(JSON.stringify(await getDesktopStatus(), null, 2)),
+   )
+ 
+@@ -404,6 +421,7 @@ if (process.env.LADDER_EXPERIMENTAL === '1') {
+     {
+       include_cli_probe_note: z.boolean().optional(),
+     },
++    { title: 'Budget-separation evidence guide', readOnlyHint: true },
+     async ({ include_cli_probe_note }) => textResponse(buildBudgetProbeGuide(include_cli_probe_note ?? false)),
+   )
+ }
+diff --git a/src/kimi-api.ts b/src/kimi-api.ts
+index 6d71c92..76fb0a5 100644
+--- a/src/kimi-api.ts
++++ b/src/kimi-api.ts
+@@ -1,5 +1,5 @@
+ import { loadApiAuth } from './environment.js'
+-import { truncateAtBoundary } from './kimi-runner.js'
++import { truncateAtBoundary } from './response.js'
+ import { clampTimeout } from './transports/acp.js'
+ import type { KimiResult } from './types.js'
+ 
+@@ -25,7 +25,7 @@ export async function runKimiApi(config: KimiApiConfig): Promise<KimiResult> {
+     return {
+       ok: false,
+       text: '',
+-      error: 'Kimi Code API key not found. Set KIMICODE_API_KEY or add api_key to ~/.kimi-code/config.toml.',
++      error: 'Kimi Code API key not found. Set KIMI_API_KEY (legacy KIMICODE_API_KEY also accepted) or add api_key to ~/.kimi-code/config.toml. Note: kimi_code works without this key; it is only needed for kimi_ask.',
+     }
+   }
+ 
+diff --git a/src/kimi-runner.test.ts b/src/kimi-runner.test.ts
+deleted file mode 100644
+index 06f3905..0000000
+--- a/src/kimi-runner.test.ts
++++ /dev/null
+@@ -1,394 +0,0 @@
+-import { describe, expect, it, vi } from 'vitest'
+-import { spawn } from 'node:child_process'
+-import { appendCapped, applyReadOnlyGuard, buildKimiArgs, parseKimiStreamJson, truncateAtBoundary } from './kimi-runner.js'
+-import type { ProgressEvent } from './types.js'
+-
+-vi.mock('./environment.js', () => ({
+-  buildKimiEnv: vi.fn(() => ({})),
+-  resolveKimiPaths: vi.fn(() => ({ binaryPath: 'kimi.exe' })),
+-}))
+-
+-vi.mock('node:child_process', () => ({
+-  spawn: vi.fn(),
+-}))
+-
+-function createMockProc(pid: number) {
+-  const callbacks: Record<string, ((...args: unknown[]) => void)[]> = {}
+-  const stdoutCallbacks: Record<string, ((...args: unknown[]) => void)[]> = {}
+-  const stderrCallbacks: Record<string, ((...args: unknown[]) => void)[]> = {}
+-  const on = (event: string, cb: (...args: unknown[]) => void) => {
+-    callbacks[event] = callbacks[event] ?? []
+-    callbacks[event].push(cb)
+-  }
+-  const makeEmitter = (store: Record<string, ((...args: unknown[]) => void)[]>) => ({
+-    on: (event: string, cb: (...args: unknown[]) => void) => {
+-      store[event] = store[event] ?? []
+-      store[event].push(cb)
+-    },
+-    emit: (event: string, ...args: unknown[]) => {
+-      for (const cb of store[event] ?? []) cb(...args)
+-    },
+-  })
+-  const stdout = makeEmitter(stdoutCallbacks)
+-  const stderr = makeEmitter(stderrCallbacks)
+-  return {
+-    pid,
+-    stdout,
+-    stderr,
+-    on,
+-    emit: (event: string, ...args: unknown[]) => {
+-      // Backward compatibility: proc-level 'data' events feed stdout only so existing
+-      // tests do not need to distinguish the two streams.
+-      if (event === 'data') {
+-        stdout.emit('data', ...args)
+-        return
+-      }
+-      for (const cb of callbacks[event] ?? []) cb(...args)
+-    },
+-  }
+-}
+-
+-describe('kimi-runner', () => {
+-  it('builds v24 analyze args with stream-json and native continuation', () => {
+-    expect(buildKimiArgs({ prompt: 'scan', continueLast: true })).toEqual([
+-      '-p',
+-      'scan',
+-      '--output-format',
+-      'stream-json',
+-      '-C',
+-    ])
+-  })
+-
+-  it('does not pass deprecated or prompt-incompatible flags', () => {
+-    const args = buildKimiArgs({ prompt: 'scan', continueLast: true })
+-    expect(args).not.toContain('--print')
+-    expect(args).not.toContain('--final-message-only')
+-    expect(args).not.toContain('-w')
+-    expect(args).not.toContain('--no-thinking')
+-    expect(args).not.toContain('--auto')
+-    expect(args).not.toContain('-y')
+-    expect(args).not.toContain('--plan')
+-  })
+-
+-  it('omits --plan for all edit values because it is incompatible with -p', () => {
+-    expect(buildKimiArgs({ prompt: 'scan' })).not.toContain('--plan')
+-    expect(buildKimiArgs({ prompt: 'scan', edit: false })).not.toContain('--plan')
+-    expect(buildKimiArgs({ prompt: 'scan', edit: true })).not.toContain('--plan')
+-  })
+-
+-  it('uses explicit -S instead of -C when session id is provided', () => {
+-    expect(buildKimiArgs({ prompt: 'continue', sessionId: 'session_123', continueLast: true })).toContain('-S')
+-    expect(buildKimiArgs({ prompt: 'continue', sessionId: 'session_123', continueLast: true })).not.toContain('-C')
+-  })
+-
+-  it('produces identical argv for edit:true and edit:false', () => {
+-    expect(buildKimiArgs({ prompt: 'scan', edit: true }))
+-      .toEqual(buildKimiArgs({ prompt: 'scan', edit: false }))
+-  })
+-})
+-
+-describe('applyReadOnlyGuard', () => {
+-  it('returns the prompt unchanged when edit is true', () => {
+-    expect(applyReadOnlyGuard('analyze this', true)).toBe('analyze this')
+-  })
+-
+-  it('prepends the read-only guard when edit is false or omitted', () => {
+-    const withFalse = applyReadOnlyGuard('analyze this', false)
+-    expect(withFalse.startsWith('[READ-ONLY ANALYSIS MODE]')).toBe(true)
+-    expect(withFalse).toContain('analyze this')
+-
+-    const withUndefined = applyReadOnlyGuard('analyze this', undefined)
+-    expect(withUndefined.startsWith('[READ-ONLY ANALYSIS MODE]')).toBe(true)
+-  })
+-})
+-
+-describe('runKimi timeout lifecycle', () => {
+-  it('clamps a zero timeout to the default and keeps the promise pending until close', async () => {
+-    const raw = [
+-      '{"role":"assistant","content":"draft"}',
+-      '{"role":"meta","type":"session.resume_hint","session_id":"session_abc"}',
+-      '{"role":"assistant","content":[{"type":"text","text":"final"}]}',
+-    ].join('\n')
+-    expect(parseKimiStreamJson(raw)).toEqual({ text: 'final', sessionId: 'session_abc' })
+-  })
+-
+-  it('tolerates leading whitespace in JSONL records', () => {
+-    const raw = '   {"role":"assistant","content":"leading spaces"}\n\t{"role":"assistant","content":"tab"}'
+-    expect(parseKimiStreamJson(raw)).toEqual({ text: 'tab' })
+-  })
+-
+-  it('keeps placeholders for non-text content parts', () => {
+-    const raw = '{"role":"assistant","content":[{"type":"image"},{"type":"tool_result"},{"type":"unknown"},{"type":"text","text":"ok"}]}'
+-    expect(parseKimiStreamJson(raw)).toEqual({ text: '[image][tool_result][unknown]ok' })
+-  })
+-
+-  it('extracts session id from meta records even when type marker differs', () => {
+-    const raw = '{"role":"meta","type":"session.resumeHint","session_id":"session_fuzzy"}'
+-    expect(parseKimiStreamJson(raw)).toEqual({ text: '(empty response from Kimi)', sessionId: 'session_fuzzy' })
+-  })
+-
+-  it('truncates at a clean boundary', () => {
+-    const text = `## A\n${'x'.repeat(100)}\n\n## B\n${'y'.repeat(100)}`
+-    const truncated = truncateAtBoundary(text, 80)
+-    expect(truncated).toContain('Output truncated')
+-    expect(truncated.length).toBeLessThan(text.length)
+-  })
+-
+-  it('appendCapped returns full concatenation when under limit', () => {
+-    expect(appendCapped('hello ', 'world', 100)).toBe('hello world')
+-  })
+-
+-  it('appendCapped truncates to exactly max when over limit', () => {
+-    const result = appendCapped('aaaa', 'bbbb', 6)
+-    expect(result).toBe('aaaabb')
+-    expect(result.length).toBe(6)
+-  })
+-
+-  it('appendCapped ignores addition when current already at limit', () => {
+-    const current = 'x'.repeat(10)
+-    expect(appendCapped(current, 'more', 10)).toBe(current)
+-  })
+-})
+-
+-describe('runKimi timeout lifecycle', () => {
+-  it('clamps a zero timeout to the default and keeps the promise pending until close', async () => {
+-    vi.useFakeTimers()
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const resultPromise = runKimi({ prompt: 'hello', timeoutMs: 0 })
+-
+-    vi.advanceTimersByTime(1)
+-    expect(vi.mocked(spawn).mock.calls.filter((call) => call[0] === 'taskkill')).toHaveLength(0)
+-
+-    vi.advanceTimersByTime(300_000)
+-    const taskkillCall = vi.mocked(spawn).mock.calls.find((call) => call[0] === 'taskkill')
+-    expect(taskkillCall).toEqual(['taskkill', ['/PID', '123', '/T', '/F'], expect.objectContaining({ stdio: 'ignore', windowsHide: true })])
+-
+-    mockProc!.emit('close', 1)
+-    const result = await resultPromise
+-    expect(result.error).toContain('timed out')
+-
+-    vi.useRealTimers()
+-  })
+-})
+-
+-describe('runKimi progress reporting', () => {
+-  it('emits coalesced message progress from stream-json chunks', async () => {
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const events: ProgressEvent[] = []
+-    const resultPromise = runKimi({ prompt: 'hello', onProgress: (e) => events.push(e) })
+-
+-    // Emit enough text to produce a truncated preview on flush.
+-    const chunk1 = 'x'.repeat(200)
+-    const chunk2 = 'y'.repeat(210)
+-    mockProc!.emit('data', Buffer.from(`{"role":"assistant","content":"${chunk1}"}\n`))
+-    mockProc!.emit('data', Buffer.from(`{"role":"assistant","content":"${chunk2}"}\n`))
+-
+-    mockProc!.emit('close', 0)
+-    const result = await resultPromise
+-
+-    expect(result.ok).toBe(true)
+-    const messageEvents = events.filter((e) => e.kind === 'message')
+-    expect(messageEvents.length).toBeGreaterThanOrEqual(1)
+-    expect(messageEvents[0].text).not.toContain('chars')
+-    expect(messageEvents[0].text).toContain('y')
+-  })
+-
+-  it('emits immediate tool_call progress events from assistant tool_calls records', async () => {
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const events: ProgressEvent[] = []
+-    const resultPromise = runKimi({ prompt: 'hello', onProgress: (e) => events.push(e) })
+-
+-    mockProc!.emit('data', Buffer.from(`${JSON.stringify({
+-      role: 'assistant',
+-      content: 'Working on it...',
+-      tool_calls: [
+-        { type: 'function', id: 't1', function: { name: 'Read', arguments: '{"path":"src/index.ts"}' } },
+-        { type: 'function', id: 't2', function: { name: 'Edit', arguments: '{"path":"src/types.ts"}' } },
+-      ],
+-    })}\n`))
+-
+-    mockProc!.emit('close', 0)
+-    const result = await resultPromise
+-
+-    expect(result.ok).toBe(true)
+-    const toolEvents = events.filter((e) => e.kind === 'tool_call')
+-    expect(toolEvents).toHaveLength(2)
+-    expect(toolEvents[0].text).toBe('Read src/index.ts')
+-    expect(toolEvents[1].text).toBe('Edit src/types.ts')
+-  })
+-
+-  it('emits a todo event when a role:tool result contains a TodoList snapshot', async () => {
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const events: ProgressEvent[] = []
+-    const resultPromise = runKimi({ prompt: 'hello', onProgress: (e) => events.push(e) })
+-
+-    mockProc!.emit('data', Buffer.from(`${JSON.stringify({
+-      role: 'tool',
+-      content: 'Todo list updated.\nCurrent todo list:\n  [done] Plan\n  [in_progress] Implement\n  [pending] Test\n\nEnsure that you continue to use the todo list.',
+-    })}
+-`))
+-
+-    mockProc!.emit('close', 0)
+-    const result = await resultPromise
+-
+-    expect(result.ok).toBe(true)
+-    const todoEvents = events.filter((e) => e.kind === 'todo')
+-    expect(todoEvents).toHaveLength(1)
+-    expect(todoEvents[0].text).toBe('TODO 1/3 ✓·· · now: Implement')
+-    expect(todoEvents[0].metadata?.todoFullList).toContain('[done] Plan')
+-    expect(todoEvents[0].metadata?.todoFullList).toContain('[in_progress] Implement')
+-  })
+-
+-  it('ignores malformed and non-JSON lines without throwing', async () => {
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const events: ProgressEvent[] = []
+-    const resultPromise = runKimi({ prompt: 'hello', onProgress: (e) => events.push(e) })
+-
+-    mockProc!.emit('data', Buffer.from('not json at all\n'))
+-    mockProc!.emit('data', Buffer.from('{invalid json}\n'))
+-    mockProc!.emit('data', Buffer.from('{"role":"unknown","content":"ignored"}\n'))
+-    mockProc!.emit('data', Buffer.from(`{"role":"assistant","content":"ok"}\n`))
+-
+-    mockProc!.emit('close', 0)
+-    const result = await resultPromise
+-
+-    expect(result.ok).toBe(true)
+-    expect(events.some((e) => e.kind === 'tool_call')).toBe(false)
+-    expect(events.some((e) => e.kind === 'message' && e.text === 'ok')).toBe(true)
+-  })
+-
+-  it('does not create a stall watchdog in CLI mode, avoiding false positives during long silent work', async () => {
+-    vi.useFakeTimers()
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const events: ProgressEvent[] = []
+-    const resultPromise = runKimi({ prompt: 'hello', onProgress: (e) => events.push(e) })
+-
+-    mockProc!.emit('close', 0)
+-    await resultPromise
+-
+-    vi.advanceTimersByTime(35_000)
+-    expect(events.some((e) => e.kind === 'stall')).toBe(false)
+-
+-    vi.useRealTimers()
+-  })
+-
+-  it('preserves both stderr and stdout labelled when the process exits non-zero', async () => {
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const resultPromise = runKimi({ prompt: 'hello' })
+-
+-    mockProc!.stdout.emit('data', Buffer.from('stdout content'))
+-    mockProc!.stderr.emit('data', Buffer.from('stderr content'))
+-    mockProc!.emit('close', 1)
+-
+-    const result = await resultPromise
+-    expect(result.ok).toBe(false)
+-    expect(result.error).toContain('kimi exited with code 1')
+-    expect(result.error).toContain('stderr: stderr content')
+-    expect(result.error).toContain('stdout: stdout content')
+-  })
+-})
+-
+-describe('runKimi cancellation', () => {
+-  it('resolves cancelled immediately when the signal is already aborted', async () => {
+-    vi.mocked(spawn).mockImplementation(() => createMockProc(999) as unknown as ReturnType<typeof spawn>)
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const controller = new AbortController()
+-    controller.abort()
+-
+-    const callsBefore = vi.mocked(spawn).mock.calls.length
+-    const result = await runKimi({ prompt: 'hello', signal: controller.signal })
+-    const callsAfter = vi.mocked(spawn).mock.calls.length
+-
+-    expect(result.ok).toBe(false)
+-    expect(result.error?.toLowerCase()).toContain('cancel')
+-    expect(callsAfter - callsBefore).toBe(0)
+-  })
+-
+-  it('kills the process and resolves cancelled when the signal aborts mid-run', async () => {
+-    let mockProc: ReturnType<typeof createMockProc>
+-    vi.mocked(spawn).mockImplementation((_cmd, args) => {
+-      if (Array.isArray(args) && args.includes('stream-json')) {
+-        mockProc = createMockProc(123)
+-        return mockProc as unknown as ReturnType<typeof spawn>
+-      }
+-      return createMockProc(999) as unknown as ReturnType<typeof spawn>
+-    })
+-
+-    const { runKimi } = await import('./kimi-runner.js')
+-    const controller = new AbortController()
+-    const resultPromise = runKimi({ prompt: 'hello', signal: controller.signal })
+-
+-    controller.abort()
+-
+-    const result = await resultPromise
+-    expect(result.ok).toBe(false)
+-    expect(result.error?.toLowerCase()).toContain('cancel')
+-
+-    const taskkillCall = vi.mocked(spawn).mock.calls.find((call) => call[0] === 'taskkill')
+-    expect(taskkillCall).toEqual(['taskkill', ['/PID', '123', '/T', '/F'], expect.objectContaining({ stdio: 'ignore', windowsHide: true })])
+-  })
+-})
+diff --git a/src/kimi-runner.ts b/src/kimi-runner.ts
+deleted file mode 100644
+index 3ec5efc..0000000
+--- a/src/kimi-runner.ts
++++ /dev/null
+@@ -1,343 +0,0 @@
+-import { spawn } from 'node:child_process'
+-import * as path from 'node:path'
+-import { clampTimeout } from './transports/acp.js'
+-import { buildKimiEnv, resolveKimiPaths } from './environment.js'
+-import { createProgressCoalescer, createTodoTracker, parseCliTodoSnapshot } from './progress.js'
+-import type { KimiResult, ProgressReporter } from './types.js'
+-
+-const MAX_CAPTURE_CHARS = 16 * 1024 * 1024
+-const MAX_FAILURE_STREAM_CHARS = 2_000
+-
+-// Append to a captured stream while enforcing a hard ceiling so a runaway CLI cannot
+-// grow the buffer without bound. Once the cap is reached, further data is dropped (the
+-// stream is still drained by Node, just not stored).
+-export function appendCapped(current: string, addition: string, max: number): string {
+-  if (current.length >= max) return current
+-  const next = current + addition
+-  return next.length > max ? next.slice(0, max) : next
+-}
+-
+-export interface KimiRunConfig {
+-  prompt: string
+-  workDir?: string
+-  sessionId?: string
+-  continueLast?: boolean
+-  timeoutMs?: number
+-  maxOutputChars?: number
+-  includeThinking?: boolean
+-  edit?: boolean
+-  onProgress?: ProgressReporter
+-  signal?: AbortSignal
+-}
+-
+-export interface ParsedKimiOutput {
+-  text: string
+-  sessionId?: string
+-}
+-
+-export function buildKimiArgs(config: KimiRunConfig): string[] {
+-  const args = ['-p', config.prompt, '--output-format', 'stream-json']
+-  if (config.sessionId) {
+-    args.push('-S', config.sessionId)
+-  } else if (config.continueLast) {
+-    args.push('-C')
+-  }
+-  // Kimi CLI 0.20.1 rejects combining --plan with -p/--prompt (non-interactive
+-  // prompt mode), and the other restriction flags (--auto, -y) are also
+-  // incompatible. For edit:false / omitted edit we therefore pass no restriction
+-  // flag and rely on the prompt/system to avoid edits.
+-  return args
+-}
+-
+-const READ_ONLY_GUARD = '[READ-ONLY ANALYSIS MODE] Do not create, modify, or delete any files, directories, or repository state. Only read, analyze, explain, and report.'
+-
+-// Prepends a read-only guard to the prompt when edit mode is not explicitly
+-// enabled. Kimi CLI 0.20.1 has no -p-compatible read-only flag, so this is the
+-// only available enforcement mechanism for the analysis-only contract.
+-export function applyReadOnlyGuard(prompt: string, edit: boolean | undefined): string {
+-  if (edit === true) return prompt
+-  return `${READ_ONLY_GUARD}\n\n${prompt}`
+-}
+-
+-function contentToText(content: unknown): string {
+-  if (typeof content === 'string') return content
+-  if (!Array.isArray(content)) return ''
+-
+-  return content.map((part) => {
+-    if (typeof part === 'string') return part
+-    if (part && typeof part === 'object') {
+-      const value = part as Record<string, unknown>
+-      if (typeof value.text === 'string') return value.text
+-      if (typeof value.content === 'string') return value.content
+-      if (typeof value.type === 'string') {
+-        if (value.type === 'image') return '[image]'
+-        if (value.type === 'tool_result') return '[tool_result]'
+-        return `[${value.type}]`
+-      }
+-    }
+-    return '[non-text]'
+-  }).join('')
+-}
+-
+-// The Kimi CLI emits tool calls on `role:assistant` records as a `tool_calls`
+-// array shaped like OpenAI function calls. Extract a concise "Action target"
+-// string so CLI runs can surface the current action as an immediate progress
+-// event, matching the ACP transport behavior.
+-function extractCliToolTarget(argsJson: string | undefined): string | undefined {
+-  if (!argsJson) return undefined
+-  try {
+-    const parsed = JSON.parse(argsJson) as Record<string, unknown>
+-    const value = parsed.path ?? parsed.skill ?? parsed.command
+-    if (typeof value === 'string' && value.trim()) {
+-      const trimmed = value.trim()
+-      return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed
+-    }
+-  } catch {
+-    // Ignore malformed argument JSON.
+-  }
+-  return undefined
+-}
+-
+-function formatCliToolCall(toolCall: unknown): string | undefined {
+-  if (!toolCall || typeof toolCall !== 'object') return undefined
+-  const tc = toolCall as Record<string, unknown>
+-  let name: string | undefined
+-  let args: string | undefined
+-  if (tc.function && typeof tc.function === 'object') {
+-    const fn = tc.function as Record<string, unknown>
+-    name = typeof fn.name === 'string' ? fn.name : undefined
+-    args = typeof fn.arguments === 'string' ? fn.arguments : undefined
+-  } else {
+-    name = typeof tc.name === 'string' ? tc.name : undefined
+-    args = typeof tc.arguments === 'string' ? tc.arguments : undefined
+-  }
+-  if (!name) return undefined
+-  const target = extractCliToolTarget(args)
+-  return target ? `${name} ${target}` : name
+-}
+-
+-function extractResumeHint(record: Record<string, unknown>): string | undefined {
+-  if (record.role !== 'meta') return undefined
+-
+-  const scan = (obj: Record<string, unknown>): string | undefined => {
+-    for (const key of ['session_id', 'sessionId', 'id', 'session']) {
+-      const value = obj[key]
+-      if (typeof value === 'string' && value.trim()) return value.trim()
+-    }
+-    return undefined
+-  }
+-
+-  // Primary match: the exact resume-hint marker Kimi emits.
+-  if (record.type === 'session.resume_hint') {
+-    const direct = scan(record)
+-    if (direct) return direct
+-    if (record.content && typeof record.content === 'object') {
+-      const nested = scan(record.content as Record<string, unknown>)
+-      if (nested) return nested
+-    }
+-  }
+-
+-  // Fuzzy fallback: any meta record carrying an id-shaped string, even if the
+-  // concrete type marker differs (e.g. session.resumeHint, session.created).
+-  const direct = scan(record)
+-  if (direct) return direct
+-  if (record.content && typeof record.content === 'object') {
+-    return scan(record.content as Record<string, unknown>)
+-  }
+-  return undefined
+-}
+-
+-export function parseKimiStreamJson(stdout: string): ParsedKimiOutput {
+-  let lastAssistant = ''
+-  let sessionId: string | undefined
+-
+-  for (const rawLine of stdout.split(/\r?\n/)) {
+-    const line = rawLine.trim()
+-    if (!line.startsWith('{')) continue
+-
+-    try {
+-      const record = JSON.parse(line) as Record<string, unknown>
+-      if (record.role === 'assistant') {
+-        const text = contentToText(record.content)
+-        if (text.trim()) lastAssistant = text
+-      }
+-      sessionId = extractResumeHint(record) ?? sessionId
+-    } catch {
+-      // Ignore non-JSON status lines.
+-    }
+-  }
+-
+-  return {
+-    text: lastAssistant.trim() || '(empty response from Kimi)',
+-    sessionId,
+-  }
+-}
+-
+-export function truncateAtBoundary(text: string, maxChars: number): string {
+-  if (text.length <= maxChars) return text
+-  const slice = text.slice(0, maxChars)
+-  const cutPoint = Math.max(slice.lastIndexOf('\n## '), slice.lastIndexOf('\n\n'), Math.floor(maxChars * 0.8))
+-  return `${slice.slice(0, cutPoint).trimEnd()}\n\n---\nOutput truncated (${text.length.toLocaleString()} chars exceeded ${maxChars.toLocaleString()} char budget). Use kimi_resume with the same session for follow-up questions.`
+-}
+-
+-function killProcessTree(pid: number | undefined): void {
+-  if (!pid) return
+-  const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+-    stdio: 'ignore',
+-    windowsHide: true,
+-  })
+-  killer.on('error', () => undefined)
+-}
+-
+-const KIMI_DEFAULT_TIMEOUT_MS = 300_000
+-const KIMI_KILL_GRACE_MS = 2_000
+-
+-export function runKimi(config: KimiRunConfig): Promise<KimiResult> {
+-  // Reuse the ACP timeout clamp so 0/NaN/negative values cannot collapse the
+-  // timeout to an immediate abort. The default matches the historic CLI budget.
+-  const timeoutMs = clampTimeout(config.timeoutMs, KIMI_DEFAULT_TIMEOUT_MS)
+-  const maxOutputChars = config.maxOutputChars ?? 60_000
+-  const paths = resolveKimiPaths()
+-
+-  if (!paths.binaryPath) {
+-    return Promise.resolve({
+-      ok: false,
+-      text: '',
+-      error: 'Kimi CLI binary was not found on PATH or at ~/.kimi-code/bin/kimi.exe.',
+-    })
+-  }
+-
+-  if (config.signal?.aborted) {
+-    return Promise.resolve({
+-      ok: false,
+-      text: '',
+-      error: 'Kimi cancelled',
+-    })
+-  }
+-
+-  const guardedPrompt = applyReadOnlyGuard(config.prompt, config.edit)
+-
+-  return new Promise((resolve) => {
+-    let settled = false
+-    const proc = spawn(paths.binaryPath!, buildKimiArgs({ ...config, prompt: guardedPrompt }), {
+-      env: buildKimiEnv(),
+-      stdio: ['ignore', 'pipe', 'pipe'],
+-      windowsHide: true,
+-      cwd: config.workDir ? path.resolve(config.workDir) : undefined,
+-    })
+-
+-    let stdout = ''
+-    let stderr = ''
+-    let timedOut = false
+-    let streamBuffer = ''
+-    const coalescer = config.onProgress ? createProgressCoalescer(config.onProgress) : undefined
+-    const todoTracker = config.onProgress ? createTodoTracker() : undefined
+-
+-    let onAbort: () => void
+-
+-    const finish = (result: KimiResult) => {
+-      if (settled) return
+-      settled = true
+-      clearTimeout(timer)
+-      coalescer?.stop()
+-      config.signal?.removeEventListener('abort', onAbort)
+-      resolve(result)
+-    }
+-
+-    onAbort = () => {
+-      killProcessTree(proc.pid)
+-      finish({ ok: false, text: '', error: 'Kimi cancelled' })
+-    }
+-    config.signal?.addEventListener('abort', onAbort, { once: true })
+-    // Cover the race where the signal is already aborted right after registration.
+-    if (config.signal?.aborted) {
+-      onAbort()
+-      return
+-    }
+-
+-    let timer = setTimeout(() => {
+-      timedOut = true
+-      killProcessTree(proc.pid)
+-      // Wait for the process exit (or a short grace) before resolving so callers
+-      // do not observe the promise settling while the tree is still being killed.
+-      timer = setTimeout(() => {
+-        finish({ ok: false, text: '', error: `Kimi timed out after ${Math.round(timeoutMs / 1000)}s` })
+-      }, KIMI_KILL_GRACE_MS)
+-    }, timeoutMs)
+-
+-    proc.stdout?.on('data', (chunk: Buffer) => {
+-      stdout = appendCapped(stdout, chunk.toString('utf-8'), MAX_CAPTURE_CHARS)
+-      if (!config.onProgress) return
+-      streamBuffer += chunk.toString('utf-8')
+-      const lines = streamBuffer.split(/\r?\n/)
+-      streamBuffer = lines.pop() ?? ''
+-      for (const rawLine of lines) {
+-        const line = rawLine.trim()
+-        if (!line.startsWith('{')) continue
+-        try {
+-          const record = JSON.parse(line) as Record<string, unknown>
+-          if (record.type === 'plan') {
+-            const text = contentToText(record.content).trim()
+-            if (text) coalescer?.add('plan', text)
+-          } else if (record.role === 'assistant') {
+-            const text = contentToText(record.content)
+-            if (text.trim()) coalescer?.add('message', text)
+-
+-            const toolCalls = record.tool_calls
+-            if (Array.isArray(toolCalls)) {
+-              for (const toolCall of toolCalls) {
+-                const toolText = formatCliToolCall(toolCall)
+-                if (toolText) coalescer?.add('tool_call', toolText)
+-              }
+-            }
+-          } else if (record.role === 'tool') {
+-            const text = contentToText(record.content)
+-            const todos = parseCliTodoSnapshot(text)
+-            if (todos && todoTracker?.update(todos)) {
+-              coalescer?.add('todo', todoTracker.getSummary(), { todoFullList: todoTracker.getFullList() })
+-            }
+-          }
+-        } catch {
+-          // Ignore non-JSON status lines.
+-        }
+-      }
+-    })
+-    proc.stderr?.on('data', (chunk: Buffer) => {
+-      // Kimi CLI 0.20.1 does not stream thinking to stderr incrementally during a
+-      // -p run; stderr is empty until process exit. We therefore do not emit live
+-      // `thought` progress events here and keep the existing end-of-run capture.
+-      stderr = appendCapped(stderr, chunk.toString('utf-8'), MAX_CAPTURE_CHARS)
+-    })
+-
+-    proc.on('error', (err) => {
+-      finish({ ok: false, text: '', error: err instanceof Error ? err.message : String(err) })
+-    })
+-
+-    proc.on('close', (code) => {
+-      if (settled) return
+-      if (timedOut) {
+-        finish({ ok: false, text: '', error: `Kimi timed out after ${Math.round(timeoutMs / 1000)}s` })
+-        return
+-      }
+-      if (code !== 0) {
+-        const err = stderr.trim()
+-        const out = stdout.trim()
+-        let message: string
+-        if (err && out) {
+-          const cappedErr = err.length > MAX_FAILURE_STREAM_CHARS ? `${err.slice(0, MAX_FAILURE_STREAM_CHARS)}…` : err
+-          const cappedOut = out.length > MAX_FAILURE_STREAM_CHARS ? `${out.slice(0, MAX_FAILURE_STREAM_CHARS)}…` : out
+-          message = `kimi exited with code ${code}\nstderr: ${cappedErr}\nstdout: ${cappedOut}`
+-        } else {
+-          message = err || out || `kimi exited with code ${code}`
+-        }
+-        finish({ ok: false, text: '', error: message })
+-        return
+-      }
+-
+-      const parsed = parseKimiStreamJson(stdout)
+-      const text = truncateAtBoundary(parsed.text, maxOutputChars)
+-      const thinking = config.includeThinking ? stderr.trim() || undefined : undefined
+-      finish({ ok: true, text, thinking, sessionId: parsed.sessionId })
+-    })
+-  })
+-}
+diff --git a/src/progress.test.ts b/src/progress.test.ts
+index 2f9a2ff..89044f1 100644
+--- a/src/progress.test.ts
++++ b/src/progress.test.ts
+@@ -20,7 +20,7 @@ describe('progress', () => {
+     expect(line).toMatch(/^\[\d{2}:\d{2}:\d{2}\] ▸ message: hello$/)
+   })
+ 
+-  it('fires a stall event after inactivity and re-arms for the next period', () => {
++  it('fires a stall event after inactivity and backs off instead of looping at a fixed rate', () => {
+     vi.useFakeTimers()
+     try {
+       const events: string[] = []
+@@ -30,12 +30,17 @@ describe('progress', () => {
+       expect(events.length).toBe(1)
+       expect(events[0]).toContain('no activity')
+ 
++      // After the first stall the delay doubles, so no second event at t=2000.
++      vi.advanceTimersByTime(1000)
++      expect(events.length).toBe(1)
++
++      // A ping resets the backoff, and the next stall fires after the base interval.
+       watchdog.ping()
+       vi.advanceTimersByTime(1000)
+       expect(events.length).toBe(2)
+ 
+       watchdog.stop()
+-      vi.advanceTimersByTime(2000)
++      vi.advanceTimersByTime(5000)
+       expect(events.length).toBe(2)
+     } finally {
+       vi.useRealTimers()
+@@ -188,6 +193,20 @@ describe('createProgressCoalescer', () => {
+     expect(events.map((e) => e.kind)).toEqual(['message', 'tool_call'])
+   })
+ 
++  it('deduplicates consecutive identical tool events by toolCallId', () => {
++    const events: { kind: string; text: string }[] = []
++    const coalescer = createProgressCoalescer((event) => { events.push({ kind: event.kind, text: event.text }) })
++
++    coalescer.add('tool_call', 'Read src/index.ts', { toolCallId: 't1' })
++    coalescer.add('tool_update', 'Read src/index.ts', { toolCallId: 't1' })
++    coalescer.add('tool_update', 'Read src/index.ts', { toolCallId: 't1' })
++    coalescer.add('tool_call', 'Edit src/types.ts', { toolCallId: 't2' })
++
++    expect(events).toHaveLength(2)
++    expect(events[0].text).toBe('Read src/index.ts')
++    expect(events[1].text).toBe('Edit src/types.ts')
++  })
++
+   it('does not emit an event for a whitespace-only tail', () => {
+     const events: { kind: string }[] = []
+     const coalescer = createProgressCoalescer((event) => { events.push({ kind: event.kind }) }, { dwellMs: 10_000 })
+diff --git a/src/progress.ts b/src/progress.ts
+index d95fbec..6c2d1bd 100644
+--- a/src/progress.ts
++++ b/src/progress.ts
+@@ -201,7 +201,7 @@ export interface ProgressCoalescerOptions {
+ }
+ 
+ export interface ProgressCoalescer {
+-  add(kind: ProgressKind, text: string, metadata?: { todoFullList?: string }): void
++  add(kind: ProgressKind, text: string, metadata?: { todoFullList?: string; toolCallId?: string }): void
+   flush(): void
+   stop(): void
+ }
+@@ -225,6 +225,22 @@ export function createProgressCoalescer(
+   let timer: NodeJS.Timeout | undefined
+   let priorityTimer: NodeJS.Timeout | undefined
+   let priorityUntil = 0
++  let lastToolCallId: string | undefined
++  let lastToolCallText: string | undefined
++
++  const isDuplicateToolEvent = (kind: ProgressKind, text: string, toolCallId: string | undefined): boolean => {
++    if (!toolCallId) return false
++    if ((kind !== 'tool_call' && kind !== 'tool_update') || toolCallId !== lastToolCallId) {
++      lastToolCallId = toolCallId
++      lastToolCallText = text
++      return false
++    }
++    // Same toolCallId as the last tool event. Drop only if the text is identical;
++    // a changed payload (e.g. status update) is still worth surfacing.
++    if (text === lastToolCallText) return true
++    lastToolCallText = text
++    return false
++  }
+ 
+   const emitTails = () => {
+     for (const kind of ['message', 'thought'] as const) {
+@@ -281,6 +297,8 @@ export function createProgressCoalescer(
+   }
+ 
+   const add: ProgressCoalescer['add'] = (kind, text, metadata) => {
++    if (isDuplicateToolEvent(kind, text, metadata?.toolCallId)) return
++
+     if (kind === 'tool_call' || kind === 'tool_update' || kind === 'plan') {
+       // During a TODO priority window, action events still surface but chatty
+       // message/thought previews stay suppressed so the checklist remains visible.
+@@ -325,17 +343,26 @@ export interface StallWatchdog {
+ export function createStallWatchdog(reporter: ProgressReporter, stallMs = DEFAULT_STALL_MS): StallWatchdog {
+   let timer: NodeJS.Timeout | undefined
+   let stopped = false
++  let consecutiveStalls = 0
++
++  const nextDelay = () => {
++    // Back off so a long silent reasoning phase does not emit a stall every
++    // fixed interval. First stall at stallMs, then 2x, 4x, capped at 8x.
++    const multiplier = consecutiveStalls >= 3 ? 8 : 2 ** consecutiveStalls
++    return stallMs * multiplier
++  }
+ 
+   const arm = () => {
+     if (stopped) return
+     timer = setTimeout(() => {
+       try {
+-        reporter(makeEvent('stall', `no activity for ${Math.round(stallMs / 1000)}s — Kimi may be stuck`))
++        reporter(makeEvent('stall', `no activity for ${Math.round(nextDelay() / 1000)}s — Kimi may be stuck`))
+       } catch {
+         // A throwing reporter must not kill the watchdog: always re-arm below.
+       }
++      consecutiveStalls += 1
+       arm()
+-    }, stallMs)
++    }, nextDelay())
+     // Do not keep the event loop alive solely for the watchdog.
+     timer.unref?.()
+   }
+@@ -345,6 +372,7 @@ export function createStallWatchdog(reporter: ProgressReporter, stallMs = DEFAUL
+   return {
+     ping() {
+       if (stopped) return
++      consecutiveStalls = 0
+       if (timer) clearTimeout(timer)
+       arm()
+     },
+diff --git a/src/task-store.test.ts b/src/task-store.test.ts
+index c9b4dd9..666439b 100644
+--- a/src/task-store.test.ts
++++ b/src/task-store.test.ts
+@@ -19,9 +19,19 @@ describe('task-store', () => {
+     expect(snapshot.output).toContain('chunk')
+     expect(snapshot.output).toContain('done')
+     expect(snapshot.outputChunks).toEqual(['chunk', 'done'])
++    expect(snapshot.outputLength).toBeGreaterThan(0)
+     expect(snapshot.metadata).toEqual({ sessionId: 's1' })
+   })
+ 
++  it('create returns compact metadata without output body', () => {
++    const store = new TaskStore()
++    const task = store.create('test', async () => ({ output: 'done' }))
++
++    expect(task.outputLength).toBe(0)
++    expect('output' in task).toBe(false)
++    expect('outputChunks' in task).toBe(false)
++  })
++
+   it('marks running tasks cancelled', async () => {
+     const store = new TaskStore()
+     const task = store.create('test', async (signal) => {
+@@ -33,6 +43,23 @@ describe('task-store', () => {
+     expect(cancelled?.status).toBe('cancelled')
+   })
+ 
++  it('cancel returns compact metadata without output body for terminal tasks', async () => {
++    const store = new TaskStore()
++    const task = store.create('test', async (_signal, append) => {
++      append('secret transcript')
++      return { output: 'done' }
++    })
++    await delay(0)
++    await delay(0)
++
++    const cancelled = await store.cancel(task.id)
++
++    expect(cancelled?.status).toBe('succeeded')
++    expect('output' in cancelled!).toBe(false)
++    expect('outputChunks' in cancelled!).toBe(false)
++    expect(cancelled?.outputLength).toBeGreaterThan(0)
++  })
++
+   it('marks tasks cancelled even when cancel hook rejects', async () => {
+     const store = new TaskStore()
+     const task = store.create(
+@@ -124,4 +151,64 @@ describe('task-store', () => {
+     expect(snapshot.output).not.toContain('late')
+     expect(snapshot.outputChunks).toEqual(['before', 'done'])
+   })
++
++  it('status snapshot returns only metadata with outputLength', async () => {
++    const store = new TaskStore()
++    const task = store.create('test', async (_signal, append) => {
++      append('line one')
++      append('line two')
++      return {}
++    })
++    await delay(0)
++    await delay(0)
++    const status = store.status(task.id)!
++    expect(status.outputLength).toBeGreaterThan(0)
++    expect('output' in status).toBe(false)
++  })
++
++  it('output paginates in full mode', async () => {
++    const store = new TaskStore()
++    const task = store.create('test', async (_signal, append) => {
++      for (let i = 0; i < 5; i++) append(`line ${i}`)
++      return {}
++    })
++    await delay(0)
++    await delay(0)
++    const slice = store.output(task.id, 'full', 1, 2)!
++    expect(slice.lines).toEqual(['line 1', 'line 2'])
++    expect(slice.offset).toBe(1)
++    expect(slice.hasMore).toBe(true)
++  })
++
++  it('output final mode returns the trailing lines', async () => {
++    const store = new TaskStore()
++    const task = store.create('test', async (_signal, append) => {
++      for (let i = 0; i < 5; i++) append(`line ${i}`)
++      return {}
++    })
++    await delay(0)
++    await delay(0)
++    const slice = store.output(task.id, 'final', 0, 2)!
++    expect(slice.lines).toEqual(['line 3', 'line 4'])
++    expect(slice.hasMore).toBe(true)
++  })
++
++  it('truncates long errors in status snapshot', async () => {
++    const store = new TaskStore()
++    const longError = 'x'.repeat(2000)
++    const task = store.create('test', async () => { throw new Error(longError) })
++    await delay(0)
++    await delay(0)
++    const status = store.status(task.id)!
++    expect(status.error).toContain('[error truncated]')
++    expect(status.error!.length).toBeLessThan(longError.length)
++  })
++
++  it('uses random task ids', async () => {
++    const store = new TaskStore()
++    const t1 = store.create('test', async () => ({}))
++    const t2 = store.create('test', async () => ({}))
++    expect(t1.id).not.toBe(t2.id)
++    expect(t1.id).toMatch(/^task_\d+_[a-z0-9]+$/)
++  })
+ })
+diff --git a/src/task-store.ts b/src/task-store.ts
+index 4d802fd..e934a8f 100644
+--- a/src/task-store.ts
++++ b/src/task-store.ts
+@@ -4,8 +4,9 @@ const MAX_TASK_OUTPUT_CHARS = 100_000
+ const MAX_TASK_OUTPUT_CHUNKS = 1_000
+ const MAX_TASKS = 100
+ const CANCEL_HOOK_TIMEOUT_MS = 5_000
++const MAX_SNAPSHOT_ERROR_CHARS = 500
+ 
+-export interface TaskSnapshot {
++export interface TaskStatusSnapshot {
+   id: string
+   kind: string
+   status: TaskStatus
+@@ -13,10 +14,25 @@ export interface TaskSnapshot {
+   startedAt?: string
+   updatedAt: string
+   finishedAt?: string
++  error?: string
++  outputLength: number
++  metadata?: Record<string, unknown>
++}
++
++export interface TaskSnapshot extends TaskStatusSnapshot {
+   output: string
+   outputChunks: string[]
++}
++
++export interface TaskOutputSlice {
++  id: string
++  status: TaskStatus
++  mode: 'final' | 'full'
++  lines: string[]
++  offset: number
++  totalLines: number
++  hasMore: boolean
+   error?: string
+-  metadata?: Record<string, unknown>
+ }
+ 
+ interface TaskRecord extends TaskSnapshot {
+@@ -24,6 +40,11 @@ interface TaskRecord extends TaskSnapshot {
+   cancel?: () => void | Promise<void>
+ }
+ 
++function randomTaskSuffix(): string {
++  // ~6 random base-36 digits are enough to avoid collisions across in-memory restarts.
++  return Math.random().toString(36).slice(2, 8)
++}
++
+ export class TaskStore {
+   private nextId = 1
+   private tasks = new Map<string, TaskRecord>()
+@@ -32,9 +53,9 @@ export class TaskStore {
+     kind: string,
+     executor: (signal: AbortSignal, append: (text: string) => void) => Promise<{ output?: string; metadata?: Record<string, unknown> }>,
+     cancel?: () => void | Promise<void>,
+-  ): TaskSnapshot {
++  ): TaskStatusSnapshot {
+     const now = new Date().toISOString()
+-    const id = `task_${this.nextId++}`
++    const id = `task_${this.nextId++}_${randomTaskSuffix()}`
+     const controller = new AbortController()
+     const task: TaskRecord = {
+       id,
+@@ -44,6 +65,7 @@ export class TaskStore {
+       updatedAt: now,
+       output: '',
+       outputChunks: [],
++      outputLength: 0,
+       controller,
+       cancel,
+     }
+@@ -73,7 +95,7 @@ export class TaskStore {
+       }
+     })
+ 
+-    return this.snapshot(task)
++    return this.statusSnapshot(task)
+   }
+ 
+   get(id: string): TaskSnapshot | undefined {
+@@ -81,16 +103,55 @@ export class TaskStore {
+     return task ? this.snapshot(task) : undefined
+   }
+ 
+-  list(): TaskSnapshot[] {
++  status(id: string): TaskStatusSnapshot | undefined {
++    const task = this.tasks.get(id)
++    return task ? this.statusSnapshot(task) : undefined
++  }
++
++  list(): TaskStatusSnapshot[] {
+     return [...this.tasks.values()]
+-      .map((task) => this.snapshot(task))
++      .map((task) => this.statusSnapshot(task))
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+   }
+ 
+-  async cancel(id: string): Promise<TaskSnapshot | undefined> {
++  output(id: string, mode: 'final' | 'full' = 'full', offset = 0, limit = 100): TaskOutputSlice | undefined {
++    const task = this.tasks.get(id)
++    if (!task) return undefined
++    const lines = task.output.split('\n')
++    const totalLines = lines.length
++    const safeOffset = Math.max(0, Math.min(offset, totalLines))
++    let safeLimit = Math.max(1, limit)
++    if (mode === 'final') {
++      // Final mode returns the trailing slice (default last line) regardless of offset.
++      safeLimit = Math.max(1, limit)
++      const start = Math.max(0, totalLines - safeLimit)
++      return {
++        id: task.id,
++        status: task.status,
++        mode,
++        lines: lines.slice(start),
++        offset: start,
++        totalLines,
++        hasMore: start > 0,
++        error: task.error ? this.truncateError(task.error) : undefined,
++      }
++    }
++    return {
++      id: task.id,
++      status: task.status,
++      mode,
++      lines: lines.slice(safeOffset, safeOffset + safeLimit),
++      offset: safeOffset,
++      totalLines,
++      hasMore: safeOffset + safeLimit < totalLines,
++      error: task.error ? this.truncateError(task.error) : undefined,
++    }
++  }
++
++  async cancel(id: string): Promise<TaskStatusSnapshot | undefined> {
+     const task = this.tasks.get(id)
+     if (!task) return undefined
+-    if (['succeeded', 'failed', 'cancelled'].includes(task.status)) return this.snapshot(task)
++    if (['succeeded', 'failed', 'cancelled'].includes(task.status)) return this.statusSnapshot(task)
+     // Mark terminal up-front (synchronously, before the first await) so a concurrent
+     // cancel(id) sees `cancelled` and returns via the guard above instead of running
+     // the (possibly non-idempotent) cancel hook a second time on the same child.
+@@ -109,7 +170,7 @@ export class TaskStore {
+         task.error = task.error ? `${task.error}; cancel hook also failed: ${cancelError}` : cancelError
+       }
+     }
+-    return this.snapshot(task)
++    return this.statusSnapshot(task)
+   }
+ 
+   append(id: string, text: string): void {
+@@ -121,6 +182,7 @@ export class TaskStore {
+     task.outputChunks.push(text)
+     task.output = task.output ? `${task.output}\n${text}` : text
+     this.trimOutput(task)
++    task.outputLength = task.output.length
+     task.updatedAt = new Date().toISOString()
+   }
+ 
+@@ -152,6 +214,7 @@ export class TaskStore {
+       task.output = task.outputChunks[0]
+     }
+ 
++    task.outputLength = task.output.length
+     this.noteTruncation(task, 'Task output exceeded the maximum size and was truncated.')
+   }
+ 
+@@ -182,7 +245,12 @@ export class TaskStore {
+     })
+   }
+ 
+-  private snapshot(task: TaskRecord): TaskSnapshot {
++  private truncateError(error: string): string {
++    if (error.length <= MAX_SNAPSHOT_ERROR_CHARS) return error
++    return `${error.slice(0, MAX_SNAPSHOT_ERROR_CHARS)}… [error truncated]`
++  }
++
++  private statusSnapshot(task: TaskRecord): TaskStatusSnapshot {
+     return {
+       id: task.id,
+       kind: task.kind,
+@@ -191,10 +259,17 @@ export class TaskStore {
+       startedAt: task.startedAt,
+       updatedAt: task.updatedAt,
+       finishedAt: task.finishedAt,
++      error: task.error ? this.truncateError(task.error) : undefined,
++      outputLength: task.output.length,
++      metadata: task.metadata ? { ...task.metadata } : undefined,
++    }
++  }
++
++  private snapshot(task: TaskRecord): TaskSnapshot {
++    return {
++      ...this.statusSnapshot(task),
+       output: task.output,
+       outputChunks: task.outputChunks.slice(-MAX_TASK_OUTPUT_CHUNKS),
+-      error: task.error,
+-      metadata: task.metadata ? { ...task.metadata } : undefined,
+     }
+   }
+ }
+diff --git a/src/transports/acp.test.ts b/src/transports/acp.test.ts
+index e0c7bfe..1b42146 100644
+--- a/src/transports/acp.test.ts
++++ b/src/transports/acp.test.ts
+@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
+ import os from 'node:os'
+ import path from 'node:path'
+ import { spawn } from 'node:child_process'
+-import { AcpClient, AcpMessageParser, clampTimeout, encodeAcpMessage, extractAcpText, runAcpPrompt } from './acp.js'
++import { AcpClient, AcpMessageParser, clampTimeout, encodeAcpMessage, extractAcpText, resolveAcpTimeout, runAcpPrompt, ACP_TIMEOUT_FLOOR_MS } from './acp.js'
+ import type { ProgressEvent } from '../types.js'
+ 
+ vi.mock('../environment.js', () => ({
+@@ -103,6 +103,12 @@ describe('acp transport', () => {
+     expect(clampTimeout(undefined, 120_000)).toBe(120_000)
+     expect(clampTimeout(30_000, 120_000)).toBe(30_000)
+   })
++
++  it('resolves ACP prompt timeouts to the 30-minute floor', () => {
++    expect(resolveAcpTimeout(undefined)).toBe(ACP_TIMEOUT_FLOOR_MS)
++    expect(resolveAcpTimeout(30_000)).toBe(ACP_TIMEOUT_FLOOR_MS)
++    expect(resolveAcpTimeout(3_600_000)).toBe(3_600_000)
++  })
+ })
+ 
+ describe('acp bidirectional request handling', () => {
+diff --git a/src/transports/acp.ts b/src/transports/acp.ts
+index df5a4ce..a1f7a07 100644
+--- a/src/transports/acp.ts
++++ b/src/transports/acp.ts
+@@ -11,7 +11,7 @@ const MAX_ACP_FRAME_BYTES = 8 * 1024 * 1024
+ const MAX_ACP_HEADER_BYTES = 16 * 1024
+ const MAX_ACP_METADATA_BYTES = 100 * 1024
+ const MAX_ACP_UPDATE_CHUNKS = 10_000
+-const DEFAULT_ACP_TIMEOUT_MS = 120_000
++export const ACP_TIMEOUT_FLOOR_MS = 1_800_000
+ const CONTENT_LENGTH_PREFIX_BYTES = 'Content-Length:'.length
+ const OUTBOUND_ID_SPACE_START = 1_000_000
+ const MAX_FS_READ_BYTES = 8 * 1024 * 1024
+@@ -32,6 +32,10 @@ export function clampTimeout(ms: number | undefined, fallback: number): number {
+   return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : fallback
+ }
+ 
++export function resolveAcpTimeout(timeoutMs?: number): number {
++  return timeoutMs === undefined ? ACP_TIMEOUT_FLOOR_MS : Math.max(ACP_TIMEOUT_FLOOR_MS, timeoutMs)
++}
++
+ // Locate the end of a header block, accepting both the canonical CRLF terminator
+ // (`\r\n\r\n`) and a lenient LF-only terminator (`\n\n`). Returns the index of the
+ // terminator and its byte length so the body offset can be computed correctly.
+@@ -63,6 +67,7 @@ export interface AcpPromptOptions {
+   timeoutMs?: number
+   signal?: AbortSignal
+   onProgress?: ProgressReporter
++  includeThinking?: boolean
+ }
+ 
+ export function encodeAcpMessage(message: JsonRpcMessage): Buffer {
+@@ -189,16 +194,19 @@ function parseJsonRpcObject(payload: string): JsonRpcMessage {
+   }
+ }
+ 
+-function extractTextDeep(value: unknown): string[] {
++const MAX_EXTRACT_DEPTH = 20
++
++function extractTextDeep(value: unknown, depth = 0): string[] {
+   if (typeof value === 'string') return [value]
+   if (!value || typeof value !== 'object') return []
+-  if (Array.isArray(value)) return value.flatMap(extractTextDeep)
++  if (depth > MAX_EXTRACT_DEPTH) return []
++  if (Array.isArray(value)) return value.flatMap((item) => extractTextDeep(item, depth + 1))
+   const record = value as Record<string, unknown>
+   const direct = ['text', 'delta']
+     .map((key) => record[key])
+     .filter((item): item is string => typeof item === 'string')
+   const nested = ['content', 'message', 'update', 'updates', 'result']
+-    .flatMap((key) => extractTextDeep(record[key]))
++    .flatMap((key) => extractTextDeep(record[key], depth + 1))
+   return [...direct, ...nested]
+ }
+ 
+@@ -225,11 +233,16 @@ export function truncateUtf8Tail(text: string, maxBytes: number): string {
+ 
+ function killProcessTree(pid: number | undefined): void {
+   if (!pid) return
+-  const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
+-    stdio: 'ignore',
+-    windowsHide: true,
+-  })
+-  killer.on('error', () => undefined)
++  try {
++    const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
++      stdio: 'ignore',
++      windowsHide: true,
++    })
++    // `spawn` can return undefined in test mocks or if taskkill is missing.
++    killer?.on('error', () => undefined)
++  } catch {
++    // Best-effort cleanup; do not let a kill failure mask the original result.
++  }
+ }
+ 
+ export class AcpClient extends EventEmitter {
+@@ -245,9 +258,9 @@ export class AcpClient extends EventEmitter {
+   workDir?: string
+   readonly closed: Promise<void>
+ 
+-  constructor(timeoutMs = DEFAULT_ACP_TIMEOUT_MS) {
++  constructor(timeoutMs = ACP_TIMEOUT_FLOOR_MS) {
+     super()
+-    this.timeoutMs = clampTimeout(timeoutMs, DEFAULT_ACP_TIMEOUT_MS)
++    this.timeoutMs = clampTimeout(timeoutMs, ACP_TIMEOUT_FLOOR_MS)
+     this.closed = new Promise<void>((resolve) => {
+       this.resolveClosed = resolve
+     })
+@@ -467,7 +480,16 @@ export class AcpClient extends EventEmitter {
+           const filePath = await this.resolveSandboxedPath(record?.path)
+           const content = typeof record?.content === 'string' ? record.content : String(record?.content ?? '')
+           await fs.mkdir(path.dirname(filePath), { recursive: true })
+-          await fs.writeFile(filePath, content, 'utf-8')
++          // Atomic write: write to a sibling temp file and rename into place so a
++          // crash cannot leave a partially-written file.
++          const tempPath = `${filePath}.tmp-${Date.now()}`
++          try {
++            await fs.writeFile(tempPath, content, 'utf-8')
++            await fs.rename(tempPath, filePath)
++          } catch (error) {
++            try { await fs.unlink(tempPath) } catch { /* ignore cleanup failure */ }
++            throw error
++          }
+           this.respond(id, {})
+           return
+         }
+@@ -593,7 +615,9 @@ function extractSessionId(value: unknown, fallback?: string): string | undefined
+ 
+ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResult> {
+   if (options.signal?.aborted) return { ok: false, text: '', error: 'ACP prompt was aborted before start.' }
+-  const client = new AcpClient(options.timeoutMs)
++  // The ACP timeout floor is mandatory: Kimi tasks routinely run longer than a
++  // couple of minutes, and the wrapper (not the host) owns the timeout.
++  const client = new AcpClient(resolveAcpTimeout(options.timeoutMs))
+   const abort = () => client.close()
+   options.signal?.addEventListener('abort', abort, { once: true })
+   // Cover the race where the signal aborts between the pre-check above and listener
+@@ -634,7 +658,8 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
+             coalescer?.add('todo', todoTracker.getSummary(), { todoFullList: todoTracker.getFullList() })
+           }
+           const kind = updateType === 'tool_call' ? 'tool_call' : updateType === 'tool_call_update' ? 'tool_update' : 'plan'
+-          coalescer?.add(kind, text)
++          const toolCallId = typeof update?.toolCallId === 'string' ? update.toolCallId : undefined
++          coalescer?.add(kind, text, toolCallId ? { toolCallId } : undefined)
+           break
+         }
+       }
+@@ -642,16 +667,18 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
+     client.on('notification', onNotification)
+   }
+ 
++  let sessionId: string | undefined
+   try {
+     client.workDir = options.workDir
+     await client.initialize()
+-    let sessionId = options.sessionId
+-    if (sessionId && options.sessionMode === 'load') {
+-      sessionId = extractSessionId(await client.loadSession(sessionId), sessionId)
+-    } else if (sessionId && options.sessionMode === 'resume') {
+-      sessionId = extractSessionId(await client.resumeSession(sessionId), sessionId)
+-    } else if (!sessionId) {
++    if (options.sessionId && options.sessionMode === 'load') {
++      sessionId = extractSessionId(await client.loadSession(options.sessionId), options.sessionId)
++    } else if (options.sessionId && options.sessionMode === 'resume') {
++      sessionId = extractSessionId(await client.resumeSession(options.sessionId), options.sessionId)
++    } else if (!options.sessionId) {
+       sessionId = extractSessionId(await client.newSession(options.workDir))
++    } else {
++      sessionId = options.sessionId
+     }
+ 
+     const result = await client.prompt(sessionId, options.prompt, options.workDir)
+@@ -678,7 +705,14 @@ export async function runAcpPrompt(options: AcpPromptOptions): Promise<KimiResul
+     const message = options.signal?.aborted
+       ? 'Kimi cancelled'
+       : error instanceof Error ? error.message : String(error)
+-    return { ok: false, text: '', error: message }
++    const isTimeout = /timed out/i.test(message)
++    return {
++      ok: false,
++      text: '',
++      error: message,
++      sessionId,
++      resumable: isTimeout,
++    }
+   } finally {
+     if (onNotification) client.off('notification', onNotification)
+     coalescer?.stop()
+diff --git a/src/transports/cli-admin.ts b/src/transports/cli-admin.ts
+index 9e4c8e6..671bfb9 100644
+--- a/src/transports/cli-admin.ts
++++ b/src/transports/cli-admin.ts
+@@ -80,8 +80,11 @@ function canonicalizePath(target: string): string {
+         throw new Error(`output_path could not be canonicalized: ${error instanceof Error ? error.message : String(error)}`)
+       }
+       const parent = path.dirname(current)
+-      if (parent === current) return path.resolve(target)
+-      tail.push(path.basename(current))
++      const base = path.basename(current)
++      if (parent === current) {
++        throw new Error(`output_path could not be canonicalized: path does not exist under a real directory: ${target}`)
++      }
++      tail.push(base)
+       current = parent
+     }
+   }
+diff --git a/src/types.ts b/src/types.ts
+index 15120a8..b82253f 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -4,6 +4,11 @@ export interface KimiResult {
+   thinking?: string
+   error?: string
+   sessionId?: string
++  resumable?: boolean
++  exitCode?: number
++  exitClass?: string
++  stderrTail?: string
++  affectedFiles?: string[]
+   metadata?: Record<string, unknown>
+ }
+ 

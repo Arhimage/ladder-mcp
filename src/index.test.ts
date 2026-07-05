@@ -99,7 +99,7 @@ vi.mock('./task-store.js', () => ({
 }))
 
 vi.mock('./kimi-mcp-config.js', () => ({
-  generateMcpConfig: vi.fn().mockReturnValue({ path: 'C:\\project\\.kimi-code\\mcp.json', serverName: 'ladder_mcp', config: {}, wrote: false }),
+  generateMcpConfig: vi.fn().mockReturnValue({ path: 'C:\\project\\.kimi-code\\mcp.json', serverName: 'ladder-mcp', config: {}, wrote: false }),
 }))
 
 vi.mock('./desktop-work.js', () => ({
@@ -128,6 +128,15 @@ beforeEach(() => {
 })
 
 describe('tool surface registration', () => {
+  it('registers the MCP server as ladder-mcp', async () => {
+    await loadServer()
+    const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js')
+    expect(vi.mocked(McpServer)).toHaveBeenCalledWith({
+      name: 'ladder-mcp',
+      version: '1.1.0-test',
+    })
+  })
+
   it('registers exactly the 6 default intent-first tools', async () => {
     await loadServer()
     expect(Object.keys(registeredTools)).toEqual([
